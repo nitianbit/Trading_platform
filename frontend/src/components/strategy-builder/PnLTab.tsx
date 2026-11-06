@@ -1,3 +1,4 @@
+import { useNow } from "@/hooks/useNow";
 /**
  * Live P&L tab — WebSocket-streamed leg LTPs with flashing cells and a
  * tick-by-tick aggregated P&L total.
@@ -130,14 +131,15 @@ export function PnLTab({ legs, enabled }: Props) {
   // Stale-tick detection: if the most recent tick across all symbols is
   // older than 30s, the market is likely closed / between sessions —
   // surface that to the user instead of showing eerily-frozen numbers.
+  const now = useNow(legs.length > 0);
   const newestTickAgeSec = useMemo(() => {
     let newest = 0;
     for (const r of legPnls) {
       if (r.lastUpdate > newest) newest = r.lastUpdate;
     }
     if (newest === 0) return null;
-    return Math.floor((Date.now() - newest) / 1000);
-  }, [legPnls]);
+    return Math.floor((now - newest) / 1000);
+  }, [legPnls, now]);
 
   if (legs.length === 0) {
     return (

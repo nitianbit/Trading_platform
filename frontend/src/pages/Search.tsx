@@ -1074,6 +1074,7 @@ function SymbolBuilder({
   // When the user flips between kinds, pick a sane default exchange so the
   // "Search this" handoff lands on the right master-contract slice.
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- Hydrate the editable form when its external selection changes.
     if (kind === "equity") setExchange("NSE");
     else setExchange("NFO");
   }, [kind]);

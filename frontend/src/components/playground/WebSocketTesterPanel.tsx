@@ -20,6 +20,7 @@ export function WebSocketTesterPanel({ apiKey, initialMessage }: WebSocketTester
   const [messageBody, setMessageBody] = useState("");
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- Hydrate the editable form when its external selection changes.
     if (initialMessage) setMessageBody(initialMessage);
   }, [initialMessage]);
 

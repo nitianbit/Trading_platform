@@ -43,6 +43,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   );
 }
 
+// eslint-disable-next-line react-refresh/only-export-components -- Preserve the established shared component and consumer API.
 export function useTheme(): ThemeContextType {
   const context = useContext(ThemeContext);
   if (!context) {

@@ -1,0 +1,8 @@
+[Unit]
+Description=DHK Paper database backup and restore verification
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/dhk-paper
+ExecStart=/usr/bin/python3 /opt/dhk-paper/scripts/database_backup.py --verify
+UMask=0077

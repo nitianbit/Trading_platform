@@ -22,7 +22,7 @@ export default function BrokerSelect() {
       if (response.kind === "internal") {
         navigate(response.url);
       } else {
-        window.location.href = response.url;
+        window.location.assign(response.url);
       }
     } catch {
       setRedirecting(null);

@@ -1,0 +1,17 @@
+FROM node:24.19.0-alpine AS build
+WORKDIR /app/frontend
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend ./
+RUN npm run build
+FROM alpine:3 AS source
+WORKDIR /source
+COPY . ./
+RUN tar -czf /source.tar.gz --exclude=./.git --exclude=./.claude --exclude=./.codex --exclude=./.local --exclude=./.env --exclude=./node_modules --exclude=./frontend/node_modules --exclude=./frontend/dist --exclude=./.venv .
+FROM caddy:2-alpine
+ARG DHK_SOURCE_FINGERPRINT
+RUN test "${#DHK_SOURCE_FINGERPRINT}" -eq 64
+LABEL io.dhk-paper.source-fingerprint=$DHK_SOURCE_FINGERPRINT
+COPY --from=build /app/frontend/dist /srv
+COPY --from=source /source.tar.gz /srv/source.tar.gz
+COPY deploy/Caddyfile /etc/caddy/Caddyfile

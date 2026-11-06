@@ -1,343 +1,324 @@
-# OpenBull (Options Trading Platform)
+# DHK Paper
 
-OpenBull is a self-hosted options trading platform for Indian markets. Multi-user, multi-broker, with a typed external API that mirrors OpenAlgo so existing trading tools work unchanged. Ships with a full options-analytics suite (option chain, IV smile, vol surface, GEX, OI tracker, …), a multi-leg **Strategy Builder + Portfolio** with live Greeks and historical charting, a tick-driven **Sandbox** simulated trading engine, live WebSocket market data, and a Redis-backed cache layer.
+A browser-based paper-trading platform with **Super Admin → Broker → User** account ownership. The web app, management panels and backend record virtual orders, trades, positions, funds and brokerage earnings inside DHK Paper.
 
-## Highlights
+**Current status:** implemented and verified locally. Public deployment remains pending. Execution prices are synthetic; no real exchange orders, deposits, withdrawals or payouts are supported.
 
-- **Five broker plugins** fully wired end-to-end — Upstox, Zerodha, Angel One (SmartAPI), Dhan, Fyers. Each carries auth, orders, funds, history, depth, margin, and a streaming adapter feeding the unified WS proxy. Plug-and-play architecture: a new broker = one folder + a `plugin.json`.
-- **Multi-user**, per-user broker credentials, JWT cookie auth, broker-token revalidation on session resume. OAuth callback redirects use the request hostname so cookies survive the round-trip even when the user mixes `127.0.0.1` and `localhost`.
-- **Live / Sandbox trading-mode toggle** — global setting; every order/info path dispatches through `dispatch_by_mode` so the same UI drives real or simulated orders. Sandbox engine simulates fills via live ticks (or a 5s polling fallback), EOD rollover, T+1 settlement, scheduled squareoff, daily P&L snapshots.
-- **Eight Plotly-backed analytics tools** + the **Strategy Builder + Portfolio** pair (multi-leg designer with **30 strategy templates** rendered as mini SVG payoff icons, live Greeks, At-Expiry / T+0 payoff curves with sigma bands and breakeven markers, Probability of Profit, real-time what-if sliders that drive both the marker dot and the T+0 curve, **Multi-Strike OI tab**, historical combined-premium chart on `lightweight-charts`, WS-streamed live P&L tab, **per-leg basket execute** with tick-snap pricing, save/reload, close-at-exit).
-- **Unified WebSocket proxy** on port 8765 — single ZeroMQ pub/sub bus fanning broker ticks (Upstox protobuf, Zerodha binary, **Fyers HSM binary**, Dhan, Angel) out to authenticated clients with mode hierarchy (DEPTH includes QUOTE includes LTP) and per-symbol throttling.
-- **Process-wide MarketDataCache** singleton — every tick hits one in-process map; sandbox MTM updater, RMS, and analytics tools read from it instead of re-hitting brokers.
-- **Redis cache layer** — API key, broker context, and master-contract symtoken cached with TTLs and invalidation on logout / OAuth.
-- **Centralized logging** — request-id stamping, sensitive-data redaction, bounded rotating files, DB-backed `error_logs` and `api_logs` tables with worker-trimmed row caps. `/logs` viewer in-app.
-- **Light / Dark / Sandbox theming** — full light & dark modes (preference persists in `localStorage`), plus a fixed slate-indigo palette that activates whenever the global trading mode is sandbox so "not live" reads instantly.
-- **`/playground` interactive tester** — Postman/Stripe-style page covering every REST + WebSocket endpoint. Sidebar of endpoints from the Bruno collection, multi-tab request editor with CodeMirror JSON, syntax-highlighted responses with status/latency/size, cURL export. WebSocket mode has a Connect/Disconnect/Ping panel and a message-template gallery. Honours the Live ↔ Sandbox toggle so the call you test is the call you'll run.
-- **Production install scripts** — `install/install.sh`, `install/update.sh`, `install/perftuning.sh` — Cloudflare-aware, A-grade nginx security headers, certbot-friendly.
+## Product overview
 
-## Tech Stack
+| Component | What it provides |
+| --- | --- |
+| User web app | Trading desk, market watch, paper orders, positions, trade history and virtual P&L. |
+| Broker panel | Invitations, access management, account activity and executed trades for the broker's own users; separate virtual brokerage earnings. |
+| Super Admin panel | Broker creation, user oversight, broker/global capacity limits, market visibility, reference-feed controls and platform settings. |
+| Backend | Authentication, permissions, transactional paper execution, brokerage accounting, market data, streaming, scheduled tasks and operational checks. |
 
-- **Backend:** FastAPI, SQLAlchemy 2.x async, PostgreSQL, asyncpg, Alembic
-- **Cache:** Redis (async, with in-process fallback)
-- **Streaming:** ZeroMQ PUB/SUB, websocket-client, protobuf (Upstox v3), Zerodha KiteTicker binary
-- **Frontend:** React 19, Vite, TypeScript (strict), TanStack Query, Tailwind CSS, shadcn/ui, Base UI primitives, Plotly (cartesian + 3D), `lightweight-charts`, Sonner toasts
-- **Security:** Argon2id password hashing + pepper, Fernet encryption at rest for broker secrets, JWT in httpOnly cookies, server-side session revocation via JTI, CSP / X-Frame-Options / nosniff headers, SlowAPI rate limiting
-- **Package managers:** [uv](https://docs.astral.sh/uv/) (Python), npm (Node)
+The user and management panels are role-specific screens in the same React web app. The FastAPI backend serves their data and enforces permissions independently of the interface.
 
-## Prerequisites
+## Accounts and onboarding
 
-- Python 3.12+
-- Node.js 20+
-- PostgreSQL 15+
-- Redis 7+ (any reachable instance — local, WSL, Docker, managed; configured via `REDIS_URL`)
+1. The operator creates the first **Super Admin** using the private setup token.
+2. Super Admin creates a **broker invitation** and shares its link privately.
+3. The broker activates the account, chooses a password and signs in.
+4. The broker creates **user invitations** under that broker account.
+5. Each user activates their invitation, chooses a password and signs in normally thereafter.
 
-## Quick Start
+There is no public signup. New users are created through brokers, and their broker ownership is permanent. Super Admin cannot bypass the hierarchy to create new users directly.
 
-### 1. Create the database
+Invitations expire after **48 hours**, can be accepted once, and can be replaced while awaiting activation. Sharing is manual: the platform displays a link to copy; it does not automatically send email or messages. Localhost links work only on the machine running the app; external sharing requires the public deployment and its configured address.
 
-```bash
-psql -U postgres -c "CREATE DATABASE openbull"
-```
+Pre-existing unassigned users keep their accounts. Super Admin can assign them to an active broker once; the platform does not choose a broker automatically. Broker assignment is required before they trade.
 
-### 2. Configure environment
+Sign-in rules:
 
-```bash
-cp .env.example .env
-```
+- Usernames are 3–80 lowercase letters, digits or underscores; they are stored in lowercase, so `Alice` and `alice` are the same account. Emails are also compared without case.
+- Passwords are 8–128 characters.
+- Browser sessions expire at **03:00 IST** each day; sign in again afterwards.
+- Login attempts are limited to 5 per minute and 25 per hour for each username and address, and 60 per minute per address.
+- Each invitation action (create a broker, create a user, replace a link) is limited to 20 per hour per client address.
 
-Generate two unique secrets and paste them into `.env`:
+## Features for users
 
-```bash
-python -c "import secrets; print(secrets.token_hex(32))"
-```
+### Trading desk and market watch
 
-Set the output as `APP_SECRET_KEY`; generate another for `ENCRYPTION_PEPPER`. Set `REDIS_URL` to your Redis instance (default `redis://127.0.0.1:6379/0`).
+- Browse enabled sample instruments by market category.
+- View synthetic prices and price changes, with approximately two-second market-watch updates.
+- Select an instrument to view two hours of synthetic price history.
+- Open Buy and Sell order tickets from market watch. Offline or stale updates display a paused-price notice and disable order submission until fresh data returns.
+- See available virtual funds, margin in use, open P&L, net realized P&L and brokerage paid since the last reset.
+- View a separate optional public-reference panel when enabled and data is available.
 
-### 3. Install and run the backend
+### Paper orders and positions
 
-```bash
-uv sync
-uv run migrate_all.py            # create tables, run schema-migrations, alembic upgrade head
-uv run uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload
-```
+- Place **Market, Limit, Stop-Loss Limit and Stop-Loss Market** orders.
+- Enter quantity with lot-size guidance and use tick-based price controls, including four-decimal currency ticks.
+- View order status, pending/filled quantities and rejection reasons.
+- Modify eligible pending orders, cancel individual orders or cancel all open orders.
+- View open positions, average prices, current prices and P&L.
+- Partially reduce a position, close one position or submit close-all instructions.
+- Review the quantity to close and the quantity that will remain before confirming a partial exit.
+- Export orders, positions and executed trades to CSV.
 
-`migrate_all.py` is idempotent — safe to re-run on every deploy. The WebSocket proxy starts alongside on port 8765.
+Trading remains subject to backend validation for funds, fees, quantity, lot size, ticks, contract expiry, market visibility, supported products and MIS cutoffs. Market orders fill immediately at the synthetic price. Pending orders fill when their conditions are met against the synthetic feed. There are no exchange trading hours or holidays; the only time-based rules are the MIS cutoffs below. An insufficient-funds rejection states the required margin, the estimated 4% brokerage and the available cash.
 
-### 4. Install and run the frontend
+### Books and account access
 
-```bash
+- Each user has a separate virtual balance and trading book.
+- Default starting capital is **₹1 crore**, subject to Super Admin's sandbox configuration.
+- The tradebook shows fills and brokerage for the current trading session.
+- Daily P&L history is available once scheduled snapshots exist.
+- Position P&L is shown separately from account net realized P&L, which includes brokerage.
+- Users cannot create accounts, access manager data, change platform settings or reset their own history/funds.
+
+## Features for brokers
+
+### Own-user management
+
+- Create user invitations under the signed-in broker account.
+- View own users and their activation/access status.
+- Replace unused invitation links.
+- Enable or disable access for own users without deleting their books.
+- See current user count and the user limit set by Super Admin.
+
+### Activity and earnings
+
+- View own users' available virtual funds, used margin, realized/open P&L and activity counts.
+- Monitor open-position counts, pending-order counts and fill counts.
+- Review executed user trades across sessions, filter by user and page through history.
+- See user identity, instrument, side, quantity, fill price, trade value, brokerage and recipient credits.
+- View the broker's separate lifetime virtual brokerage earnings.
+
+Brokers cannot create brokers, change their own capacity limit, change global policy or access another broker's users, trades or earnings. The activity overview summarizes positions; it is not an interface for placing trades on behalf of users.
+
+## Features for Super Admin
+
+### Broker and user oversight
+
+- Create broker invitations and view broker activation/access status.
+- Replace unused broker or user invitations within the management scope.
+- Enable or disable broker and user access.
+- View users across all brokers and assign eligible legacy users once.
+- View account balances, P&L and activity summaries across the platform.
+- Review all users' executed trades, with user filtering and history pagination.
+- View Super Admin's separate lifetime virtual brokerage earnings.
+
+Disabling a broker blocks access for the broker and its users. Disabling access preserves records; it does not cancel pending orders or close positions, and those pending orders can still fill and incur brokerage. Re-enabled accounts require fresh browser login because prior sessions remain revoked; their existing API keys work again. Existing quote-only sockets are not actively disconnected.
+
+### Capacity controls
+
+- Set the maximum number of user accounts across the platform.
+- Set a separate maximum number of users for each broker.
+- Pending invitations and disabled users count toward these limits.
+- Super Admin and broker accounts do not consume user-account capacity.
+- Blank means unlimited; **0 pauses new user creation**.
+- Lowering a cap preserves existing accounts and their access.
+- The limits apply to registered user accounts, not simultaneous online sessions.
+
+### Market and platform controls
+
+- Enable or disable complete market groups or individual sample instruments.
+- Disabled instruments disappear from market watch and reject new exposure through the backend.
+- Existing positions can still be reduced or closed.
+- Pending opening orders are checked again at execution; they are not automatically cancelled when a switch changes.
+- Enable or disable the public-reference panel and individual reference assets. The panel is **on by default** in a new installation. The provider's commercial-use terms were checked on 6 November 2026; availability is not guaranteed. See [data coverage and provider limits](docs/market-data.md).
+- Edit supported sandbox parameters, including starting-capital defaults, leverage, session and square-off settings.
+- Save platform controls with revision checking: a stale admin tab receives a conflict and must load the latest policy before saving. Unsaved edits prompt before navigation/sign-out; reload refreshes the current account count too.
+
+Sandbox parameters are global simulation settings. Changing a starting-capital default does not provide an immediate per-user credit/top-up feature. Automatic weekly book resets are disabled by default; users have no self-reset control.
+
+Super Admin can reset its own practice book from `/sandbox`. A separate API-only action, `POST /web/sandbox/wipe-all`, resets **every** account's orders, trades, positions and daily P&L to the starting capital. It is destructive and has no confirmation screen. Fee records and manager earnings are kept, so lifetime earnings can afterwards exceed what the remaining trade history shows.
+
+## Permissions at a glance
+
+| Capability | User | Broker | Super Admin |
+| --- | --- | --- | --- |
+| Trade in own paper book | Yes, with broker assignment | Yes, own practice book | Yes, own practice book |
+| Create user invitations | No | Own users | New users must come through brokers |
+| Create broker invitations | No | No | Yes |
+| Manage user access | No | Own users | All users |
+| Manage broker access | No | No | Yes |
+| View executed user trades | Own trades | Own users | All users |
+| View manager earnings | No | Own broker earnings | Own admin earnings |
+| Set broker/global user limits | No | No | Yes |
+| Change market/feed settings | No | No | Yes |
+| Transfer an assigned user to another broker | No | No | No |
+
+## Brokerage and virtual earnings
+
+Every executed **user buy and user sell** charges **4% of the full executed trade value**:
+
+| Executed trade value | Deducted from user | Broker earnings | Super Admin earnings |
+| --- | --- | --- | --- |
+| ₹1 | ₹0.04 | ₹0.03 | ₹0.01 |
+| ₹100 | ₹4 | ₹3 | ₹1 |
+| One Gold sample lot at ₹80,993 (₹80,99,300) | ₹3,23,972 | ₹2,42,979 | ₹80,993 |
+
+- Opening and closing are separate executions; both incur brokerage.
+- Futures fees use full executed notional, rather than just the margin blocked. With the default 10× futures margin, each execution's fee equals 40% of the margin blocked.
+- Fees are checked when an order is placed or modified but are not reserved while it is pending. If competing orders use the cash first, the fill is rejected without a charge.
+- Only filled quantity is charged. Unfilled, cancelled and rejected quantities earn no brokerage.
+- Each partial fill is charged separately.
+- Fees reduce user virtual cash and account net realized P&L.
+- Manager earnings are separate virtual balances, not additions to their practice-trading capital.
+- Personal broker/Super Admin practice trades have the documented fee exemption.
+- No historical trades are charged retroactively.
+- Valid reducing exits may leave virtual cash negative after losses and fees.
+
+The ledger records integer paise. It rounds the total fee half up, allocates 75% of that rounded fee to the broker with half-up rounding, and gives the remainder to Super Admin. Tiny fills can therefore differ from an exact 3%/1% split by a paisa. Lifetime manager earnings survive authorized paper-book resets; the user's current-book fee counter resets with that book.
+
+There are no real-money payout or withdrawal routes. See [brokerage accounting](docs/brokerage.md) for calculation details.
+
+## Markets and data coverage
+
+### Synthetic execution instruments
+
+The current catalogue has **17 illustrative instruments**:
+
+| Market group | Samples |
+| --- | --- |
+| NSE Futures | NIFTY and BANK NIFTY futures |
+| NSE Options | NIFTY 25000 Call and Put |
+| NSE Equity | Reliance sample equity |
+| MCX | Crude Oil, Gold, Silver, Natural Gas, Copper, Zinc, Aluminium and Lead futures |
+| BSE Futures | SENSEX futures |
+| MSE | USD/INR futures |
+| GIFT NIFTY | GIFT NIFTY sample |
+| Global | US 500 sample |
+
+These are continuously generated demonstration prices, not connected live exchange quotes. Prices, lots, expiry metadata and margin rules are illustrative. All paper books use virtual INR, including global/GIFT samples; there is no FX conversion.
+
+### Product availability
+
+- Equity entries use **MIS**.
+- Derivative samples support **NRML**; MIS is available only where the backend has a configured square-off lifecycle and the applicable cutoff permits it.
+- New MIS exposure on **MSE, GIFT and Global** is rejected; use NRML. Existing MIS positions there can only be reduced or closed.
+- New **CNC delivery exposure and T+1 settlement are disabled**. Existing CNC positions are exit-only: increases, reversals and sells larger than the position are rejected, including pending and simultaneous exits. A complete holdings lifecycle is not available.
+- MIS square-off runs at **15:15 IST** (NSE, NFO, BSE, BFO), **16:45 IST** (CDS/BCD currency) and **23:30 IST** (MCX). From the cutoff until 09:00 IST, MIS orders can only reduce an existing position; an exit cannot reverse it.
+- Default leverage is 5× for equity MIS and 10× for futures, so margin is 20% and 10% of trade value; option buyers pay the full premium. Super Admin can change these in `/sandbox`.
+
+### Public reference prices
+
+The optional Gold API integration can display seven USD reference assets: Gold, Silver, Platinum, Palladium, Copper, Bitcoin and Ethereum. It requires no provider API key and polls approximately every 30 seconds, subject to availability.
+
+Reference prices show provider timestamps and freshness state. Missing, failed or stale data is marked unavailable/stale; synthetic prices do not replace it. These references never enter the execution-price cache or price a paper fill. This free public API is separate from an open-source exchange-data service. See [market-data notes](docs/market-data.md).
+
+## Backend capabilities
+
+| Area | Implemented capability |
+| --- | --- |
+| Accounts and authentication | Password hashing, browser sessions, invitation activation, per-account API keys, session revocation and login/API admission limits. |
+| Authorization | Server-enforced roles, permanent broker ownership, cross-broker isolation and enabled/activated-account checks. |
+| Trading ledger | Account-locked transactions for order, fill, position, virtual cash and brokerage changes; duplicate-fill/replay protection and rollback on failure. |
+| Order validation | Finite prices, positive quantity, lot/tick rules, expiry, available margin/fees, supported products and disabled-market checks. |
+| Financial records | Virtual balances, margin, gross/net realized P&L, fee breakdown and recipient-specific earnings records. |
+| Market data | Shared synthetic feed/cache, separate public-reference polling and stale execution-feed protection. |
+| Streaming | Authenticated synthetic LTP/Quote updates; production WSS through `/stream`. Depth is explicitly unsupported. |
+| Scheduled work | Configured MIS square-off, catch-up processing, expiry handling and daily P&L snapshots. |
+| Operations | Dependency/feed readiness, explicit production migration checks, private backup creation and scratch-database restore verification. |
+
+The stack uses **React + Vite**, **FastAPI**, **SQLAlchemy/PostgreSQL**, and **Redis**. PostgreSQL owns durable account/trading records; Redis supports shared admission limits and caching. Caddy serves the production frontend and proxies HTTPS/WSS.
+
+### API and streaming access
+
+- Each account has a paper API key. The OpenAlgo-style REST endpoints under `/api/v1/` take the key in the JSON body and apply the same validation, market policy and brokerage as the web app. Order endpoints are limited to 10 requests per second per account.
+- Split orders are not available in this paper build.
+- Streaming is at `ws://127.0.0.1:8783` locally and `wss://<your domain>/stream` in production. Authenticate with the API key, then subscribe in LTP or Quote mode; depth subscriptions are rejected. Updates are labelled `synthetic_demo`.
+- The web app has no page for viewing or rotating API keys. Signed-in sessions can use `GET /web/apikey` and `POST /web/apikey`; rotation takes effect immediately.
+- The [API reference](docs/api/README.md) is inherited from OpenBull and still describes upstream behaviour such as CNC; where it differs, the rules in this README apply.
+
+## Pages and local addresses
+
+| Screen/service | Address | Access |
+| --- | --- | --- |
+| First Super Admin setup | http://127.0.0.1:5183/setup | Operator setup token; refused once an account exists |
+| Invitation activation | `/invite#token=…` (from the shared link) | Public; the link is the credential |
+| Login | http://127.0.0.1:5183/login | Activated accounts |
+| Trading desk | http://127.0.0.1:5183/dashboard | Signed-in accounts |
+| Orders / positions / trades | `/orderbook`, `/positions`, `/tradebook` | Own paper book |
+| P&L history | `/sandbox/mypnl` | Own history |
+| Management overview | http://127.0.0.1:5183/admin | Broker or Super Admin |
+| User management | http://127.0.0.1:5183/customers | Broker or Super Admin, scoped by role |
+| Paper settings | `/sandbox` | Super Admin |
+| Backend readiness | http://127.0.0.1:8083/health | Health check |
+| Local API documentation | http://127.0.0.1:8083/docs | Development only; disabled in production |
+| Market-data streaming | ws://127.0.0.1:8783 | API key; `wss://<your domain>/stream` in production |
+| Source archive | `/source.tar.gz` | Public in production (footer link) |
+
+Users land on the trading desk after login. Brokers and Super Admin land on their management overview. The platform does not expose inherited upstream pages merely because their source files remain in the repository.
+
+## Run locally
+
+Use the pinned toolchain: **Node.js 24.19.0**, **npm 11.17.0**, and **Python 3.12.14**, with uv and Docker Compose available. Versions are recorded in `.nvmrc`, `.python-version` and `frontend/package.json`; dependency locks are committed.
+
+From the project directory:
+
+```sh
+python3 scripts/init_local.py
+docker compose -p dhk-paper -f compose.paper.yml up -d --wait
+uv sync --frozen
 cd frontend
-npm install
-npm run dev
+npm ci
+cd ..
+.venv/bin/python scripts/migrate_database.py --local
+.venv/bin/python scripts/dev.py
 ```
 
-### 5. Open the app
+Configuration generation preserves an existing `.env`. Migration first creates and restore-verifies a private backup. On an existing installation, stop its backend before running an upgrade migration.
 
-Visit **http://127.0.0.1:5173** (the Vite server binds to IPv4 loopback only).
+For a new database, open http://127.0.0.1:5183/setup and use the operator setup token from the private configuration to create Super Admin. Setup refuses further creation once an account exists. Never put tokens or passwords into this README.
 
-- First visit: create the admin account at `/setup`.
-- Login, configure broker credentials at `/broker/config`.
-- Select a broker and complete OAuth at `/broker/select`.
-- Dashboard shows live funds; the topbar toggles Live ↔ Sandbox.
+On the prepared Mac, **Start DHK Paper.command** starts the local database and web services. Keep its Terminal window open; Ctrl+C stops the web services. The project-owned PostgreSQL volume persists when containers stop. No external broker credentials are needed for paper trading.
 
-## Production deployment
+## Verification and deployment status
 
-`install/install.sh` is a Cloudflare-aware Ubuntu installer that sets up Postgres, Redis, nginx with A-grade security headers, systemd units, certbot, and the swap file (helpful on small VMs). Re-run `install/update.sh` to pull, run `migrate_all.py`, build the frontend, and reload services. `install/perftuning.sh` applies sensible Postgres/Redis kernel + ulimit tuning.
+Last verified locally on **6 November 2026**:
 
-```bash
-sudo ./install/install.sh
-# follow the certbot prompts; nginx proxies /auth, /web, /upstox, /zerodha, /ws to the backend
-```
+- **51 backend tests** plus real HTTP checks passed using disposable databases/accounts.
+- **4 frontend regression tests** passed.
+- Desktop/mobile browser checks passed for invitations, three-role login, logout/login, partial exits, modal keyboard focus, price ticks, market failures, contrast assertions and page width.
+- Frontend production build passed. Lint has **0 errors and 10 warnings**; a bundle-size warning remains.
+- Rebuilt production images passed disposable, certificate-verified HTTPS/WSS checks, including authentication, streamed ticks, private service ports and the source archive.
+- Private backup restoration was tested. Existing owner account, credential, balance and trading-book fingerprints were preserved across local activation.
 
-## API endpoints (35+)
+An independent review on the same day (16:25–22:17 IST) re-ran these checks on an isolated copy of the working tree, using its own disposable PostgreSQL/Redis containers:
 
-Full per-endpoint docs: [docs/api/README.md](docs/api/README.md). Bruno collection: `collections/openbull/`.
+- The suite passed: 51 backend tests, 18 HTTP check groups and the browser workflow. `npm test` gave 4/4, lint gave 0 errors and 10 warnings, and the build passed.
+- Its own HTTP, ledger and browser probes reproduced the permission, capacity, invitation, CNC/MIS, settings-conflict, four-decimal and brokerage rules above, at 1440×900 and 390×844.
+- Production startup refused a database without the migration stamp and created no tables.
+- The local production images match the current source. The deployment check passed against freshly built images.
+- Gold API terms could not be checked against the provider's official pages in that review.
 
-### External API — `/api/v1/*` (API-key auth)
+CI configuration is included in [paper-checks.yml](.github/workflows/paper-checks.yml); its presence does not establish that a GitHub run has completed. See [launch repairs](docs/launch-repairs.md) for evidence and limits.
 
-| Group | Endpoints |
-|------|-----------|
-| Order management | `placeorder`, `placesmartorder`, `basketorder`, `splitorder`, `optionsorder`, `optionsmultiorder`, `modifyorder`, `cancelorder`, `cancelallorder`, `closeposition` |
-| Account & info | `funds`, `margin`, `orderbook`, `tradebook`, `positions` (`positionbook`), `holdings`, `orderstatus`, `openposition` |
-| Market data | `quotes`, `multiquotes`, `depth`, `history`, `intervals` |
-| Symbols & options | `symbol`, `search`, `expiry`, `optionsymbol`, `optionchain`, `syntheticfuture`, `optiongreeks` |
-| Analytics tools | `oitracker`, `maxpain`, `ivchart`, `ivsmile`, `volsurface`, `straddle`, `gex` |
-| Utility | `ping`, `analyzer` |
+For backend/API/browser verification, use `.venv/bin/python scripts/test_isolated.py --browser` after installing frontend dependencies, building the frontend and installing Playwright Chromium. Do not run the standalone QA helpers against the owner's database. Frontend checks are `npm test`, `npm run lint` and `npm run build` from `frontend/`.
 
-### Web API — `/web/*` (session cookie auth)
+Production packaging includes private PostgreSQL/Redis/backend services, Caddy HTTPS/WSS, secure cookies, a corresponding-source archive and a backup-first migration command. Follow [deployment instructions](docs/deployment.md) for host setup and image/restore checks. Production startup verifies its migration stamp instead of applying schema changes automatically. The migration and startup preflight refuse to activate while delivery holdings exist or unassigned legacy users hold positions or pending orders. They do not change those records.
 
-| Group | Endpoints |
-|------|-----------|
-| Auth / setup | `auth/check-setup`, `auth/setup`, `auth/login`, `auth/logout`, `auth/me`, `auth/broker-redirect`, broker callbacks |
-| Strategies | `strategies` (CRUD), `strategybuilder/snapshot`, `strategybuilder/chart`, `strategybuilder/multi-strike-oi` |
-| Trading mode | `trading-mode` (GET/POST) |
-| Sandbox | `sandbox/config`, `sandbox/reset`, `sandbox/summary`, `sandbox/mypnl`, `sandbox/squareoff-now`, `sandbox/settle-now` |
-| Logs | `api-logs`, `error-logs` |
-| Symbols | `symbols/search`, `symbols/underlyings`, `symbols/status` (master-contract download status) |
+## Current limitations and remaining work
 
-### WebSocket Streaming (port 8765)
+- Public hosting, DNS and domain HTTPS acceptance are not configured.
+- Off-host encrypted backup storage, retention and delivered alerts require operator configuration; local backup/timer templates are supplied.
+- Target-host load/capacity validation and broader assistive-technology testing remain.
+- Live exchange execution feeds and real brokerage execution are not connected.
+- CNC delivery/holdings, market depth, native mobile apps and password recovery are not implemented in the shipped flow.
+- Invitations require manual sharing; automatic email/SMS delivery is not implemented.
+- Provider availability and redistribution terms must be checked before enabling references publicly.
+- This work is not yet committed, so the CI workflow has not run.
 
-```json
-{"action": "authenticate", "api_key": "..."}
-{"action": "subscribe", "symbols": [{"symbol": "NIFTY", "exchange": "NSE_INDEX"}], "mode": "Quote"}
-```
+Known issues from the 6 November review (none affect accounting or permissions):
 
-| Mode | Wire string | Data |
-|------|-------------|------|
-| LTP | `"LTP"` | Last traded price + change/cp/ltq, 50ms throttle |
-| Quote | `"QUOTE"` | OHLCV + OI + volume + bid/ask totals |
-| Depth | `"DEPTH"` / `"FULL"` | 5-level bid/ask market depth |
+- If the browser goes offline, the trading desk keeps showing the last prices and "Updates every 2 seconds" with no warning. Orders then fail with a generic "Network Error". It recovers on reconnection.
+- Subscribing to an unknown symbol on the stream is acknowledged as successful but sends no data. Quote updates do not include bid/ask.
+- Platform controls discard unsaved edits without a warning when you leave the page.
+- The deployment check runs the in-container migration with its own backup, rather than the host-side `scripts/migrate_database.py` command. Backup verification compares table counts only.
+- `scripts/test_isolated.py` leaves its shared symbol-cache keys in Redis DB 15.
 
-Mode hierarchy: subscribing to DEPTH includes QUOTE includes LTP automatically. Limits: 10 concurrent client connections, 64 KB max message size, 1000 symbols per subscribe call. Full protocol: [docs/design/websockets-format.md](docs/design/websockets-format.md).
+These are local implementation and verification results, not certification of public production capacity or exchange-accurate trading.
 
-## Features
+## Source and license
 
-### Strategy Builder + Strategy Portfolio (`/tools/strategybuilder` + `/tools/strategyportfolio`)
+Built on [marketcalls/OpenBull](https://github.com/marketcalls/openbull) at commit `e06f1591a519fc58a26aebadda682c71bb624ac9`. Original attribution and the [AGPL-3.0 license](License.md) are retained. The production footer supplies the fork's corresponding-source archive, excluding private configuration, credentials and backups.
 
-The flagship feature pair. UI ported piece-by-piece from openalgo's reference design (and in some places now ahead of it).
+## Load and release evidence
 
-**Symbol header** — chip strip across the top: Spot, **Futures** (synthetic via put-call parity, never a separate broker call), ATM IV, DTE (with end-of-day IST rollover), Lot Size, plus a live-status pill.
-
-**30 strategy templates** rendered as a card gallery with **mini SVG payoff icons** — direction tabs (Bullish / Bearish / Neutral) with live counts, search box. Clicking a card opens **TemplateConfigDialog**: a preview modal listing the resolved legs (chain-sourced strike dropdowns, editable lots / entry, net debit/credit summary) so the user can tweak before applying. Calendar / diagonal templates correctly resolve `expiryOffset` against the broker's expiry list.
-
-**Add a Position** card — manual leg builder with explicit Segment / Expiry / Strike (with ATM / ITMn / OTMn moneyness chip) / Type / Side / Lot Qty stepper + dedicated ADD BUY and ADD SELL buttons. Resolves the OpenAlgo symbol live and shows the chain LTP at the top right.
-
-**Six tabs**:
-- **Legs** — manual builder + leg list with chain-sourced strike dropdown + moneyness chip; pencil opens `EditLegDialog` (full per-leg modal with auto-LTP refill on strike/type change), trash deletes.
-- **Greeks** — per-leg + aggregate Greeks, plain-English labels (Delta / Gamma / Theta / Vega — never Δ Γ Θ V; openbull is a retail product).
-- **Payoff** — two-pane: `PositionsPanel` on the left (per-leg checkbox toggle, 2-column stats grid for Max Profit / Max Loss / POP / RR / Total P&L / Net Credit / Est. Premium / **Margin Req.** sourced from `/api/v1/margin`, breakevens row with chip badges, Save + Execute Basket actions in the footer); At-Expiry + T+0 curves + sigma bands + breakeven markers + spot vertical + "Unlimited" annotations + POP badge on the right.
-- **Strategy Chart** — historical combined-premium time series on `lightweight-charts`, P&L vs Premium toggle, per-leg lines, underlying overlay on a secondary y-axis, openalgo-parity columns (`net_premium`, `combined_premium`, `tag` credit/debit/flat).
-- **Multi-Strike OI** — per-leg Open Interest history overlaid on `lightweight-charts`, underlying close on the second axis, IST timestamps.
-- **P&L** — WS-streamed live MTM with flash cells.
-
-**What-if simulator** — Spot ±10%, IV ±10pp, Days forward sliders drive both the magenta marker AND the dashed T+0 curve on the payoff chart (T+0 re-prices every leg under the shifted IV / time, not just the marker). Local-only Black-76 — instant feedback, no broker round-trips.
-
-**Save / load** via `/web/strategies/*` (per-user, JSONB legs, tagged with trading mode). Saved strategies are immediately visible in an in-page **Load Strategy** picker (no need to bounce to the Portfolio page); the cache invalidates on save so a fresh save is always one click away.
-
-**Basket execute** via `/api/v1/basketorder` — `BasketOrderDialog` shows per-leg rows with Use checkbox, editable Lots, editable tick-snapped Price (disabled for MARKET / SL-M), Pricetype + Product as global controls, BUY-before-SELL ordering enforced server-side, inline per-row result indicators (✓ orderid on success, × message on error). Sandbox-aware.
-
-**Strategy Portfolio**: list with mode / status / underlying filters (status as a segmented pill group), 2-column card grid on lg+ viewports, expandable cards, **one shared WebSocket** across the page (a symbol used in three strategies streams once), live aggregate P&L per card, close-at-exit dialog with editable per-leg exit prices, hard delete.
-
-### Analytics Tools (`/tools`)
-
-| Page | Backend service | API |
-|---|---|---|
-| Option Chain | `option_chain_service` | `/api/v1/optionchain` (+ live WS) |
-| OI Tracker | `oi_tracker_service` | `/api/v1/oitracker` |
-| Max Pain | `max_pain_service` | `/api/v1/maxpain` |
-| Option Greeks (historical) | `option_greeks_service` | `/api/v1/optiongreeks` |
-| IV Smile | `iv_smile_service` | `/api/v1/ivsmile` |
-| Vol Surface (3D) | `vol_surface_service` | `/api/v1/volsurface` |
-| Straddle Chart | `straddle_chart_service` | `/api/v1/straddle` |
-| GEX Dashboard | `gex_service` | `/api/v1/gex` |
-
-All analytics pages are `React.lazy` so Plotly's heavy bundle is fetched only on navigation. IST timestamp handling is consistent across every chart. CE = RED (`#ef4444`) and PE = GREEN (`#22c55e`) by convention — high CE OI is bearish.
-
-### Sandbox Simulated Trading
-
-A tick-driven simulation engine (`backend/sandbox/`) with full lifecycle parity to live trading. Every order/info service routes through `dispatch_by_mode` so the same UI / API drives either real or simulated orders.
-
-- **Per-user simulated capital + margin lifecycle** — margin booked at order placement, transferred to position on fill, released pro-rata on reduce/close.
-- **Tick-driven fills** with a 5-second polling fallback when the WS feed is quiet.
-- **Scheduled squareoff** (per-bucket: NSE/NFO/BSE/BFO at 15:15, CDS at 16:45, MCX at 23:30 — configurable in `/sandbox`).
-- **T+1 settlement** — CNC fills move to a holdings table on EOD; daily P&L snapshots persisted.
-- **Catch-up on restart** — stale MIS positions, T+1 settlement, today_realized_pnl reset, expired F&O contracts all reconciled before the engine starts ticking.
-
-`/sandbox` config page lets admins tune starting capital, leverage, squareoff times. `/sandbox/mypnl` shows the per-user daily P&L history.
-
-### Symbol Search (`/search`)
-
-OpenAlgo-style tokenized async search across the full master-contract table. Multi-token AND matching, exchange filters, instrument-type filters. The same search powers the Underlying combobox in every options tool.
-
-### Live / Sandbox Toggle
-
-Topbar switch. Persists in `app_settings` (single global flag), with a 10s in-memory cache to avoid a DB hit per request. The frontend tints the theme amber when sandbox is active and shows a banner above the page content. Strategies saved while sandbox is on are tagged accordingly so the Portfolio's "live" filter doesn't bleed.
-
-### MarketDataCache + WebSocket Test (`/websocket/test`)
-
-Process-wide `MarketDataCache` singleton receives every tick from the WS proxy and exposes them to internal consumers (sandbox MTM updater, ticker pages). The `/websocket/test` dev page reads cached ticks for arbitrary symbols and shows the connection state — useful when diagnosing broker-side issues without opening a fresh subscription.
-
-### Logging & Audit
-
-- **Request-id stamping** — every log line is correlated to a request via a contextvar; copies into the response header.
-- **Sensitive-data redaction** — automatic stripping of `access_token`, `api_secret`, etc. from log payloads.
-- **Bounded rotating files** — `openbull.log` and `openbull-error.log` capped at 10×10 MB each (200 MB total on disk).
-- **DB-backed `error_logs` and `api_logs` tables** with worker-trimmed row caps so attacker floods can't blow up the table.
-- **`/logs` viewer** in-app — filter by trading mode, status, time range; auth-gated.
-
-## Project Structure
-
-Full directory tree: [docs/design/ARCHITECTURE.md](docs/design/ARCHITECTURE.md). Top-level summary:
-
-```
-openbull/
-├── alembic/                    # Migrations (idempotent under migrate_all.py)
-├── install/                    # install.sh, update.sh, perftuning.sh
-├── backend/
-│   ├── main.py                 # FastAPI app, lifespan, middleware order
-│   ├── config.py               # Pydantic Settings
-│   ├── database.py             # SQLAlchemy async engine + Base
-│   ├── security.py             # Argon2, Fernet, JWT
-│   ├── dependencies.py         # FastAPI DI + Redis cache-aside
-│   ├── middleware*.py          # Request-id, access log, DB-backed api_logs
-│   ├── models/                 # SQLAlchemy ORM (users, broker_*, sandbox_*,
-│   │                           #   strategies, strategy_module, audit, ...)
-│   ├── schemas/                # Pydantic request/response
-│   ├── routers/                # Web routes (cookie auth)
-│   ├── api/                    # External API (/api/v1, key auth)
-│   ├── services/               # Business logic — order, options, analytics,
-│   │                           #   strategy_builder, strategy_chart,
-│   │                           #   multi_strike_oi, sandbox, trading_mode,
-│   │                           #   market_data_cache, margin
-│   ├── sandbox/                # Simulated trading engine
-│   ├── strategy/               # Strategy-module foundation (schema, CRUD,
-│   │                           #   symbol resolver, security) — engine in flight
-│   ├── events/                 # In-process event bus (strategy_events, ...)
-│   ├── subscribers/            # Event-bus consumers (audit writer, ...)
-│   ├── broker/                 # 5 broker plugins
-│   │   ├── upstox/, zerodha/, angel/, dhan/, fyers/
-│   ├── websocket_proxy/        # Unified WS proxy (ZeroMQ architecture)
-│   └── utils/                  # logging, redis_client, symtoken_cache, plugin_loader
-├── frontend/
-│   └── src/
-│       ├── pages/              # incl. tools/StrategyBuilder, tools/StrategyPortfolio
-│       ├── components/         # incl. strategy-builder/, strategy-portfolio/
-│       ├── hooks/              # useMarketData, useChainContext, useStrategySnapshot
-│       ├── api/                # Typed wrappers per feature
-│       └── lib/                # black76, probabilityOfProfit, strategyTemplates
-├── collections/                # Bruno API collection
-├── docs/                       # api/, design/ (ARCHITECTURE, SERVICES, websockets, symbol-format)
-└── .env.example
-```
-
-## Broker Plugin System
-
-Each broker lives in `backend/broker/{name}/`:
-
-```
-broker/{name}/
-├── plugin.json                 # name, display_name, supported_exchanges, oauth_type
-├── api/
-│   ├── auth_api.py             # OAuth token exchange
-│   ├── order_api.py            # place / modify / cancel
-│   ├── funds.py                # account funds + margin
-│   ├── data.py                 # quotes / depth / history; SUPPORTED_INTERVALS map
-│   └── margin_api.py           # pre-trade margin calculator
-├── mapping/
-│   ├── transform_data.py       # OpenBull <-> broker order fields
-│   ├── order_data.py           # response mapping (token <-> symbol)
-│   └── margin_data.py          # margin request/response normalization
-├── streaming/
-│   └── {broker}_adapter.py     # WebSocket → ZMQ adapter
-└── database/
-    └── master_contract_db.py   # Symbol download + symtoken bulk insert
-```
-
-To add a broker: create the directory, implement the modules, drop a `plugin.json`, and add the name to `VALID_BROKERS` in `.env`. The plugin loader picks it up on next startup.
-
-## WebSocket Architecture
-
-```
-Client WS (port 8765)
-    ⇅ JSON                                                    
-WS Proxy (asyncio + websockets)
-    ⇅ ZeroMQ SUB <—— PUB ⇅
-                          Broker Adapter (background thread)
-                          ⇅ broker-native protocol
-                          Upstox protobuf v3 / Zerodha binary
-                                ⇣
-                          MarketDataCache singleton (every tick)
-```
-
-`MarketDataCache` is the single source of live data for internal consumers. The proxy supports DEPTH ⊇ QUOTE ⊇ LTP hierarchy so subscribing to DEPTH delivers all three message types automatically.
-
-## Environment Variables
-
-Selected — see `.env.example` for the full list.
-
-| Variable | Description | Default |
-|---|---|---|
-| `APP_SECRET_KEY` | JWT signing key (required) | — |
-| `ENCRYPTION_PEPPER` | Fernet/Argon2 pepper (required) | — |
-| `DATABASE_URL` | PostgreSQL async DSN | `postgresql+asyncpg://postgres:123456@localhost/openbull` |
-| `REDIS_URL` | Redis (cache + symtoken mirror) | `redis://127.0.0.1:6379/0` |
-| `FRONTEND_URL` | OAuth-redirect base (host substituted dynamically per request) | `http://127.0.0.1:5173` |
-| `CORS_ORIGINS` | Allowed origins, comma-separated | `http://127.0.0.1:5173,http://localhost:5173` |
-| `VALID_BROKERS` | Enabled broker plugins | `upstox,zerodha` |
-| `COOKIE_SECURE` | Set true in production over HTTPS | `false` |
-| `SESSION_EXPIRY_TIME` | Daily session expiry IST | `03:00` |
-| `WEBSOCKET_HOST` / `WEBSOCKET_PORT` | WS proxy bind | `127.0.0.1:8765` |
-| `WEBSOCKET_URL` | External WS URL (for SDK consumers) | `ws://127.0.0.1:8765` |
-| `ZMQ_HOST` / `ZMQ_PORT` | ZeroMQ bus | `127.0.0.1:5555` |
-| `MAX_SYMBOLS_PER_WEBSOCKET` | Symbols per WS connection | `1000` |
-| `MAX_WEBSOCKET_CONNECTIONS` | Concurrent WS clients | `3` |
-| `LOG_FILE_MAX_MB` / `LOG_FILE_BACKUP_COUNT` | Rotating log size + retention | `10` / `9` |
-| `ERROR_LOG_DB_MAX_ROWS` / `API_LOG_DB_MAX_ROWS` | DB-backed log table caps | `50000` / `100000` |
-
-## Production Build
-
-```bash
-cd frontend && npm run build && cd ..
-uv run uvicorn backend.main:app --host 0.0.0.0 --port 8000
-```
-
-FastAPI serves `frontend/dist/` automatically. The WebSocket proxy starts alongside on port 8765. Behind nginx, proxy `/auth`, `/web`, `/upstox`, `/zerodha`, `/api`, `/health`, `/ws` to the backend (`install/install.sh` does this for you).
-
-## Documentation
-
-Start at [docs/README.md](docs/README.md) — index of every doc with one-line descriptions, grouped by audience.
-
-Highlights:
-- [Product Overview](docs/PRODUCT.md) — what OpenBull is, who it's for, capability matrix, user journeys
-- [API Reference](docs/api/README.md) — per-endpoint docs with tested request/response samples
-- [Architecture](docs/design/ARCHITECTURE.md) — system design, data flows, caching layer, logging, trading modes
-- [Services](docs/design/SERVICES.md) — business-logic layer reference (every service, signature, location)
-- [Broker Integration](docs/design/broker-integration.md) — how to add a sixth broker
-- [WebSocket Protocol](docs/design/websockets-format.md) — wire format, modes, limits
-- [Symbol Format](docs/design/symbol-format.md) — OpenAlgo-compatible symbology
-- [Order Constants](docs/design/order-constants.md) — valid exchanges, products, pricetypes, actions
-
-## License
-
-AGPL-3.0
+The local production HTTPS stack passed 100 authenticated read requests/second (3,000 requests, p95 8.57 ms). A 100-orders/second guarantee is not established: the final raised-admission test accepted 93.94/second with p95 2.32 seconds. Default API admission remains 50/second per IP and 10 orders/second per user. See [capacity evidence and required changes](docs/capacity.md), [launch repairs](docs/launch-repairs.md), and [GitHub checks](https://github.com/nitianbit/Trading_platform/actions). Owner credentials and saved books were preserved; load accounts were disposable.

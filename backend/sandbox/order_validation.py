@@ -10,7 +10,7 @@ all the rejection rules openalgo enforces:
 * Quantity is a positive multiple of the F&O lot size.
 * Price is a positive multiple of the tick size (LIMIT / SL only).
 * Product / exchange combination is legal (CNC only on equity, etc).
-* CNC SELL only against existing holdings + intraday buys.
+* CNC is exit-only; unsupported MIS exchanges are exit-only.
 * Post-squareoff order block — MIS orders are rejected after the configured
   cut-off time **unless** they reduce an existing position. The block lifts
   again at 09:00 IST the next day.
@@ -23,12 +23,15 @@ position book and the config table; everything else is symbol-master-local.
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
+import math
 from datetime import datetime, timedelta, timezone
 from typing import Iterable
 
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
-from backend.models.sandbox import SandboxConfig, SandboxHolding, SandboxPosition
+from backend.models.sandbox import SandboxConfig, SandboxPosition
 from backend.sandbox._db import session_scope
 from backend.sandbox.symbol_info import (
     EQUITY_EXCHANGES,
@@ -63,12 +66,12 @@ DEFAULT_SQUAREOFF: dict[str, str] = {
 }
 
 
-def _read_squareoff_time(exchange: str) -> tuple[int, int] | None:
+def _read_squareoff_time(exchange: str, db: Session | None = None) -> tuple[int, int] | None:
     """Returns ``(hour, minute)`` or ``None`` if exchange has no squareoff."""
     key = SQUAREOFF_CFG_KEY.get(exchange.upper())
     if key is None:
         return None
-    with session_scope() as db:
+    with (nullcontext(db) if db is not None else session_scope()) as db:
         row = db.execute(
             select(SandboxConfig).where(SandboxConfig.key == key)
         ).scalar_one_or_none()
@@ -84,37 +87,16 @@ def _is_multiple(value: float, step: float, tol: float = 1e-6) -> bool:
     """Float-safe ``value % step == 0``."""
     if step <= 0:
         return True  # nothing to enforce
+    if not math.isfinite(value / step):
+        return False
     n = round(value / step)
     return abs(n * step - value) <= tol
 
 
-def _existing_long_qty(user_id: int, symbol: str, exchange: str) -> int:
-    """Net long quantity available for a CNC SELL — sums the user's holding
-    (settled delivery) and the same-day intraday CNC long position. Matches
-    openalgo's "you must own these shares" rule."""
-    with session_scope() as db:
-        holding_qty = db.execute(
-            select(SandboxHolding.quantity).where(
-                SandboxHolding.user_id == user_id,
-                SandboxHolding.symbol == symbol,
-                SandboxHolding.exchange == exchange,
-            )
-        ).scalar() or 0
-        position_qty = db.execute(
-            select(SandboxPosition.net_quantity).where(
-                SandboxPosition.user_id == user_id,
-                SandboxPosition.symbol == symbol,
-                SandboxPosition.exchange == exchange,
-                SandboxPosition.product == "CNC",
-            )
-        ).scalar() or 0
-    return int(holding_qty) + max(0, int(position_qty))
-
-
-def _is_reducing(user_id: int, symbol: str, exchange: str, product: str, action: str) -> bool:
+def _is_reducing(user_id: int, symbol: str, exchange: str, product: str, action: str, quantity: int, db: Session | None = None) -> bool:
     """``True`` when (action) is opposite the existing (product) position. Used
     by the squareoff-time block to allow exits even after cut-off."""
-    with session_scope() as db:
+    with (nullcontext(db) if db is not None else session_scope()) as db:
         net = db.execute(
             select(SandboxPosition.net_quantity).where(
                 SandboxPosition.user_id == user_id,
@@ -125,14 +107,14 @@ def _is_reducing(user_id: int, symbol: str, exchange: str, product: str, action:
         ).scalar()
     if net is None or int(net) == 0:
         return False
-    return (int(net) > 0 and action == "SELL") or (int(net) < 0 and action == "BUY")
+    return 0 < quantity <= abs(int(net)) and ((int(net) > 0 and action == "SELL") or (int(net) < 0 and action == "BUY"))
 
 
-def is_after_squareoff(exchange: str, now: datetime | None = None) -> bool:
+def is_after_squareoff(exchange: str, now: datetime | None = None, *, db: Session | None = None) -> bool:
     """``True`` between the squareoff cut-off and 09:00 IST next day. Crypto
     and unknown exchanges return ``False`` (always tradable). Currency cut-off
     of 16:45 means the block window for CDS is 16:45 → 09:00 next day, etc."""
-    parsed = _read_squareoff_time(exchange)
+    parsed = _read_squareoff_time(exchange, db)
     if parsed is None:
         return False
     hh, mm = parsed
@@ -158,6 +140,8 @@ def validate_order(
     product: str,
     price: float,
     trigger_price: float,
+    db: Session | None = None,
+    remaining_quantity: int | None = None,
 ) -> tuple[bool, str, SymbolInfo | None]:
     """Run every pre-placement gate. Returns
     ``(ok, rejection_reason, symbol_info_or_None)``.
@@ -177,8 +161,10 @@ def validate_order(
         return False, f"unsupported pricetype: {pricetype}", None
     if product not in ("MIS", "NRML", "CNC"):
         return False, f"unsupported product: {product}", None
-    if quantity <= 0:
-        return False, "quantity must be > 0", None
+    if not math.isfinite(price) or not math.isfinite(trigger_price):
+        return False, "prices must be finite numbers", None
+    if not 0 < quantity <= 2147483647:
+        return False, "quantity must fit a positive database integer", None
 
     if not is_product_exchange_compatible(product, exchange):
         return False, (
@@ -186,9 +172,22 @@ def validate_order(
             f"(CNC: NSE/BSE only; NRML: derivatives only)"
         ), None
 
-    info = get_symbol_info(symbol, exchange)
+    info = get_symbol_info(symbol, exchange, db=db)
     if info is None:
         return False, f"unknown symbol {symbol} on {exchange}", None
+
+    from backend.paper.policy import order_access
+    allowed, reason = order_access(db=db, user_id=user_id, symbol=symbol, exchange=exchange,
+        product=product, action=action, quantity=quantity if remaining_quantity is None else remaining_quantity)
+    if not allowed:
+        return False, reason, info
+
+    from backend.sandbox.catch_up import get_contract_expiry
+    expiry = get_contract_expiry(symbol, exchange, info.expiry)
+    if info.expiry and expiry is None:
+        return False, "Invalid contract expiry metadata", info
+    if expiry is not None and expiry < datetime.now(tz=IST).date():
+        return False, "Contract has expired", info
 
     instrument_type = info.instrument_type or classify_from_symbol(symbol, exchange)
 
@@ -216,19 +215,9 @@ def validate_order(
                 f"{info.tick_size}"
             ), info
 
-    # CNC SELL must be against existing inventory (holdings + same-day CNC longs).
-    # Real exchanges reject naked short-deliveries; we follow openalgo's rule.
-    if product == "CNC" and action == "SELL":
-        owned = _existing_long_qty(user_id, symbol, exchange)
-        if quantity > owned:
-            return False, (
-                f"CNC SELL of {quantity} {symbol} exceeds owned quantity {owned} "
-                f"(holdings + intraday CNC longs)"
-            ), info
-
     # MIS post-squareoff block. Reducing exits stay open.
-    if product == "MIS" and is_after_squareoff(exchange):
-        if not _is_reducing(user_id, symbol, exchange, product, action):
+    if product == "MIS" and is_after_squareoff(exchange, db=db):
+        if not _is_reducing(user_id, symbol, exchange, product, action, quantity if remaining_quantity is None else remaining_quantity, db):
             return False, (
                 f"MIS orders for {exchange} are blocked after squareoff time "
                 f"(open positions can still be reduced; new entries resume at 09:00 IST)"

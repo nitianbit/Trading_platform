@@ -12,7 +12,7 @@ const api = axios.create({
 // the user to /login. Anywhere else, a 401 (e.g. session expired mid-session)
 // snaps back to the login screen so the user is never stuck on a half-loaded
 // authenticated page.
-const PUBLIC_PATHS = new Set(["/", "/login", "/setup"]);
+const PUBLIC_PATHS = new Set(["/", "/login", "/setup", "/invite"]);
 
 api.interceptors.response.use(
   (response) => response,

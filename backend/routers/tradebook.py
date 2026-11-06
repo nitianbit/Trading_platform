@@ -15,7 +15,7 @@ router = APIRouter(prefix="/web", tags=["tradebook"])
 
 
 @router.get("/tradebook")
-async def tradebook(ctx: BrokerContext = Depends(get_broker_context)):
+def tradebook(ctx: BrokerContext = Depends(get_broker_context)):
     """Get trade book data from the broker."""
     success, response_data, status_code = get_tradebook_with_auth(
         auth_token=ctx.auth_token,

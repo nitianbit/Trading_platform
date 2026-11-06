@@ -5,7 +5,7 @@
  * Ported from openalgo. Substitutes openbull's ScrollArea primitive (Base UI)
  * for the original Radix one — behaviour is identical.
  */
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { ChevronDown, ChevronRight, Download, Search, Trash2 } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
@@ -87,21 +87,12 @@ interface MessageLogProps {
 export function MessageLog({ messages, onClear, onExport }: MessageLogProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const [expandedMessages, setExpandedMessages] = useState<Set<string>>(new Set());
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const prevMessagesLengthRef = useRef(messages.length);
 
   const filteredMessages = useMemo(() => {
     if (!searchQuery.trim()) return messages;
     const q = searchQuery.toLowerCase();
     return messages.filter((msg) => JSON.stringify(msg.data).toLowerCase().includes(q));
   }, [messages, searchQuery]);
-
-  if (messages.length !== prevMessagesLengthRef.current && scrollRef.current) {
-    prevMessagesLengthRef.current = messages.length;
-    if (scrollRef.current.scrollTop === 0) {
-      scrollRef.current.scrollTop = 0;
-    }
-  }
 
   const toggleExpanded = useCallback((id: string) => {
     setExpandedMessages((prev) => {
@@ -245,7 +236,7 @@ export function MessageLog({ messages, onClear, onExport }: MessageLogProps) {
       </div>
 
       <ScrollArea className="flex-1">
-        <div ref={scrollRef} className="p-2 space-y-1.5">
+        <div className="p-2 space-y-1.5">
           {filteredMessages.length === 0 ? (
             <div className="flex flex-col items-center justify-center py-12 text-center">
               <div className="text-muted-foreground/30 text-4xl mb-3">⋄</div>

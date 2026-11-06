@@ -1,4 +1,5 @@
 from pydantic_settings import BaseSettings
+from pydantic import model_validator
 from functools import lru_cache
 
 
@@ -6,6 +7,9 @@ class Settings(BaseSettings):
     # Core secrets
     app_secret_key: str
     encryption_pepper: str
+
+    setup_token: str = ""
+    production: bool = False
 
     # Database
     database_url: str = "postgresql+asyncpg://postgres:123456@localhost:5432/openbull"
@@ -20,7 +24,7 @@ class Settings(BaseSettings):
     cors_origins: str = "http://127.0.0.1:5173,http://localhost:5173"
 
     # Brokers
-    valid_brokers: str = "upstox,zerodha"
+    valid_brokers: str = "demo"
 
     # Logging
     log_level: str = "INFO"
@@ -62,11 +66,23 @@ class Settings(BaseSettings):
 
     # Redis (cache backend)
     redis_url: str = "redis://127.0.0.1:6379/0"
+    redis_key_prefix: str = "openbull:"
 
     # WebSocket Connection Pooling
     max_symbols_per_websocket: int = 1000
     max_websocket_connections: int = 3
     enable_connection_pooling: bool = True
+
+    @model_validator(mode="after")
+    def production_requirements(self):
+        if self.production:
+            if not self.cookie_secure or self.flask_debug:
+                raise ValueError("Production requires secure cookies and debug disabled")
+            if min(len(self.app_secret_key), len(self.encryption_pepper)) < 32:
+                raise ValueError("Production requires independent secrets of at least 32 characters")
+            if not self.frontend_url.startswith("https://") or any(not origin.startswith("https://") for origin in self.cors_origin_list):
+                raise ValueError("Production requires HTTPS frontend and CORS origins")
+        return self
 
     @property
     def cors_origin_list(self) -> list[str]:
@@ -80,7 +96,7 @@ class Settings(BaseSettings):
     def sync_database_url(self) -> str:
         return self.database_url.replace("+asyncpg", "+psycopg")
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
+    model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore", "hide_input_in_errors": True}
 
 
 @lru_cache

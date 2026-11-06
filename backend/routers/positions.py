@@ -15,7 +15,7 @@ router = APIRouter(prefix="/web", tags=["positions"])
 
 
 @router.get("/positions")
-async def positions(ctx: BrokerContext = Depends(get_broker_context)):
+def positions(ctx: BrokerContext = Depends(get_broker_context)):
     """Get open positions from the broker."""
     success, response_data, status_code = get_positions_with_auth(
         auth_token=ctx.auth_token,

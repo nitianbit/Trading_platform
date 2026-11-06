@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -352,7 +352,7 @@ export default function OptionChain() {
   const [orderTarget, setOrderTarget] = useState<OrderTarget | null>(null);
   const [visibleColumns, setVisibleColumns] = useState<ColumnKey[]>(() => loadVisibleColumns());
 
-  const prevChainRef = useRef<Map<number, OptionStrike>>(new Map());
+  const [previousChain, setPreviousChain] = useState<Map<number, OptionStrike>>(() => new Map());
 
   // Broker-aware F&O exchange options. Falls back to the full hardcoded
   // FNO_EXCHANGES list when broker capabilities aren't loaded, so the picker
@@ -363,6 +363,7 @@ export default function OptionChain() {
   // first available option.
   useEffect(() => {
     if (fnoExchangeOptions.length && !fnoExchangeOptions.some((o) => o.value === exchange)) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- Keep selection valid when the external contract list changes.
       setExchange(fnoExchangeOptions[0].value);
     }
   }, [fnoExchangeOptions, exchange]);
@@ -387,6 +388,7 @@ export default function OptionChain() {
   useEffect(() => {
     if (underlyings.length === 0) return;
     if (!underlyings.some((u) => u.symbol === underlying)) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- Keep selection valid when the external contract list changes.
       setUnderlying(underlyings[0].symbol);
       setExpiry("");
     }
@@ -401,6 +403,7 @@ export default function OptionChain() {
   });
   useEffect(() => {
     if (expiriesQuery.data?.status === "success" && expiriesQuery.data.data.length > 0) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- Keep selection valid when the external contract list changes.
       setExpiry((prev) =>
         prev && expiriesQuery.data!.data.includes(prev) ? prev : expiriesQuery.data!.data[0]
       );
@@ -438,17 +441,17 @@ export default function OptionChain() {
     const t = setTimeout(() => {
       const m = new Map<number, OptionStrike>();
       data.chain.forEach((s) => m.set(s.strike, s));
-      prevChainRef.current = m;
+      setPreviousChain(m);
     }, 200);
     return () => clearTimeout(t);
-  }, [data?.chain]);
+  }, [data]);
 
-  const pcr = useMemo(() => (data?.chain ? calcPCR(data.chain) : 0), [data?.chain]);
+  const pcr = useMemo(() => (data?.chain ? calcPCR(data.chain) : 0), [data]);
   const totals = useMemo(
     () => (data?.chain ? calcTotals(data.chain) : { ceOi: 0, peOi: 0 }),
-    [data?.chain]
+    [data]
   );
-  const maxOi = useMemo(() => (data?.chain ? calcMaxOi(data.chain) : 1), [data?.chain]);
+  const maxOi = useMemo(() => (data?.chain ? calcMaxOi(data.chain) : 1), [data]);
 
   const spotChange =
     data && data.underlying_prev_close > 0 ? data.underlying_ltp - data.underlying_prev_close : 0;
@@ -762,7 +765,7 @@ export default function OptionChain() {
                   <OptionChainRow
                     key={s.strike}
                     strike={s}
-                    prev={prevChainRef.current.get(s.strike)}
+                    prev={previousChain.get(s.strike)}
                     maxOi={maxOi}
                     optionExchange={exchange}
                     visibleColumns={orderedVisibleColumns}

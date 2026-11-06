@@ -1,909 +1,174 @@
-import { useEffect, useMemo, useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
-import { useQuery } from "@tanstack/react-query";
-import {
-  Card,
-  CardContent,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
-import {
-  getDashboard,
-  getHoldings,
-  getOrderbook,
-  getPositions,
-  getTradebook,
-} from "@/api/dashboard";
-import { listStrategies } from "@/api/strategy_module";
+import { useNow } from "@/hooks/useNow";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { onlineManager, useQuery, useQueryClient } from "@tanstack/react-query";
+import { createChart, LineSeries, ColorType } from "lightweight-charts";
+import type { UTCTimestamp, IChartApi, ISeriesApi } from "lightweight-charts";
+import { Link } from "react-router-dom";
+import api from "@/config/api";
+import { getDashboard, getPositions } from "@/api/dashboard";
+import { PlaceOrderDialog } from "@/components/trading/PlaceOrderDialog";
+import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import type {
-  OrderbookItem,
-  PositionItem,
-  TradebookItem,
-} from "@/types/order";
-import type { StrategyListItem } from "@/types/strategy_module";
+import { ReferencePrices } from "@/components/trading/ReferencePrices";
+import { formatPrice } from "@/lib/price";
+import { errorMessage } from "@/lib/apiError";
 
-// ---------------------------------------------------------------------------
-// Formatters
-// ---------------------------------------------------------------------------
+interface Instrument {
+  symbol: string; name: string; exchange: string; group: string;
+  lot: number; tick: number; ltp: number; change_percent: number;
+}
+interface Market { data_source: "synthetic_demo"; instruments: Instrument[] }
 
-const INR = new Intl.NumberFormat("en-IN", {
-  style: "currency",
-  currency: "INR",
-  minimumFractionDigits: 2,
-});
+const money = (value: number) => new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 2 }).format(value);
 
-const COMPACT_NUMBER = new Intl.NumberFormat("en-IN", {
-  maximumFractionDigits: 0,
-});
-
-function formatCurrency(value: number): string {
-  return INR.format(value);
+// Lightweight Charts accepts RGB/hex; canvas resolves the app's OKLCH tokens once.
+function chartColor(value: string): string {
+  const context = document.createElement("canvas").getContext("2d");
+  if (!context) return "#64748b";
+  context.fillStyle = value;
+  context.fillRect(0, 0, 1, 1);
+  const [r, g, b, alpha] = context.getImageData(0, 0, 1, 1).data;
+  return `rgba(${r},${g},${b},${alpha / 255})`;
 }
 
-function formatCompactINR(value: number): string {
-  const abs = Math.abs(value);
-  const sign = value < 0 ? "-" : "";
-  if (abs >= 1e7) return `${sign}₹${(abs / 1e7).toFixed(2)} Cr`;
-  if (abs >= 1e5) return `${sign}₹${(abs / 1e5).toFixed(2)} L`;
-  if (abs >= 1e3) return `${sign}₹${(abs / 1e3).toFixed(1)} K`;
-  return `${sign}₹${abs.toFixed(2)}`;
-}
-
-function pnlColor(value: number): string {
-  if (value > 0) return "text-emerald-600 dark:text-emerald-400";
-  if (value < 0) return "text-rose-600 dark:text-rose-400";
-  return "text-foreground";
-}
-
-function pnlBgTint(value: number): string {
-  if (value > 0)
-    return "bg-emerald-500/8 ring-emerald-500/30 dark:bg-emerald-500/10";
-  if (value < 0) return "bg-rose-500/8 ring-rose-500/30 dark:bg-rose-500/10";
-  return "bg-muted/40 ring-border";
-}
-
-function withSign(value: number, formatter: (n: number) => string): string {
-  if (value > 0) return `+${formatter(value)}`;
-  return formatter(value);
-}
-
-// ---------------------------------------------------------------------------
-// Order/trade visual helpers
-// ---------------------------------------------------------------------------
-
-type OrderTone = "complete" | "pending" | "rejected" | "cancelled";
-
-function orderTone(status: string): OrderTone {
-  const s = status.toLowerCase();
-  if (s.includes("complete") || s.includes("filled") || s.includes("executed"))
-    return "complete";
-  if (s.includes("reject")) return "rejected";
-  if (s.includes("cancel")) return "cancelled";
-  return "pending";
-}
-
-const orderToneStyles: Record<OrderTone, { dot: string; label: string }> = {
-  complete: { dot: "bg-emerald-500", label: "text-emerald-600 dark:text-emerald-400" },
-  pending: { dot: "bg-amber-500", label: "text-amber-600 dark:text-amber-400" },
-  rejected: { dot: "bg-rose-500", label: "text-rose-600 dark:text-rose-400" },
-  cancelled: { dot: "bg-muted-foreground/60", label: "text-muted-foreground" },
-};
-
-function actionTone(action: string): string {
-  return action.toUpperCase() === "BUY"
-    ? "text-emerald-600 dark:text-emerald-400"
-    : "text-rose-600 dark:text-rose-400";
-}
-
-// ---------------------------------------------------------------------------
-// Loaders for sub-sections (all reuse-existing-endpoints, low staleness)
-// ---------------------------------------------------------------------------
-
-function useDashboardData() {
-  const funds = useQuery({
-    queryKey: ["dashboard"],
-    queryFn: getDashboard,
-    refetchInterval: 30_000,
+function PriceChart({ instrument }: { instrument: Instrument }) {
+  const target = useRef<HTMLDivElement>(null);
+  const chartState = useRef<{ chart: IChartApi; series: ISeriesApi<"Line">; fitted: boolean } | null>(null);
+  const query = useQuery({
+    queryKey: ["paper-chart", instrument.symbol, instrument.exchange],
+    queryFn: async () => (await api.get<{ points: { time: number; value: number }[] }>("/web/paper/chart", {
+      params: { symbol: instrument.symbol, exchange: instrument.exchange },
+    })).data.points,
+    refetchInterval: 10000,
   });
-  const positions = useQuery({
-    queryKey: ["dashboard", "positions"],
-    queryFn: getPositions,
-    refetchInterval: 15_000,
-    staleTime: 10_000,
-  });
-  const holdings = useQuery({
-    queryKey: ["dashboard", "holdings"],
-    queryFn: getHoldings,
-    refetchInterval: 60_000,
-    staleTime: 30_000,
-  });
-  const orders = useQuery({
-    queryKey: ["dashboard", "orderbook"],
-    queryFn: getOrderbook,
-    refetchInterval: 20_000,
-    staleTime: 10_000,
-  });
-  const trades = useQuery({
-    queryKey: ["dashboard", "tradebook"],
-    queryFn: getTradebook,
-    refetchInterval: 30_000,
-    staleTime: 15_000,
-  });
-  const strategies = useQuery({
-    queryKey: ["dashboard", "strategies"],
-    queryFn: () => listStrategies(),
-    refetchInterval: 30_000,
-    staleTime: 15_000,
-  });
-  return { funds, positions, holdings, orders, trades, strategies };
-}
-
-// ---------------------------------------------------------------------------
-// Section: KPI strip
-// ---------------------------------------------------------------------------
-
-function KpiStrip({
-  dayPnl,
-  openPositions,
-  holdingsCount,
-  runningStrategies,
-  totalStrategies,
-}: {
-  dayPnl: number;
-  openPositions: number;
-  holdingsCount: number;
-  runningStrategies: number;
-  totalStrategies: number;
-}) {
-  const items = [
-    {
-      label: "Day P&L",
-      value: withSign(dayPnl, formatCompactINR),
-      hint: "Realized + unrealized today",
-      valueClass: pnlColor(dayPnl),
-      tint: pnlBgTint(dayPnl),
-    },
-    {
-      label: "Open Positions",
-      value: COMPACT_NUMBER.format(openPositions),
-      hint: openPositions === 0 ? "No active exposure" : "Net active legs",
-      valueClass: "text-foreground",
-      tint: "bg-muted/40 ring-border",
-    },
-    {
-      label: "Holdings",
-      value: COMPACT_NUMBER.format(holdingsCount),
-      hint: "Long-term inventory",
-      valueClass: "text-foreground",
-      tint: "bg-muted/40 ring-border",
-    },
-    {
-      label: "Strategies",
-      value: `${runningStrategies} / ${totalStrategies}`,
-      hint: runningStrategies > 0 ? "Currently running" : "None running",
-      valueClass: runningStrategies > 0 ? "text-foreground" : "text-muted-foreground",
-      tint:
-        runningStrategies > 0
-          ? "bg-emerald-500/8 ring-emerald-500/25 dark:bg-emerald-500/10"
-          : "bg-muted/40 ring-border",
-    },
-  ];
-
-  return (
-    <div className="grid grid-cols-2 gap-3 sm:gap-4 lg:grid-cols-4">
-      {items.map((it) => (
-        <div
-          key={it.label}
-          className={cn(
-            "rounded-lg px-3 py-3 ring-1 ring-inset sm:px-4 sm:py-3.5",
-            it.tint
-          )}
-        >
-          <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
-            {it.label}
-          </p>
-          <p
-            className={cn(
-              "mt-1 text-xl font-bold tracking-tight tabular-nums sm:text-2xl",
-              it.valueClass
-            )}
-          >
-            {it.value}
-          </p>
-          <p className="mt-0.5 truncate text-[11px] text-muted-foreground/85">
-            {it.hint}
-          </p>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Section: Positions snapshot
-// ---------------------------------------------------------------------------
-
-function PositionsSnapshot({
-  positions,
-  isLoading,
-}: {
-  positions: PositionItem[];
-  isLoading: boolean;
-}) {
-  const sorted = useMemo(
-    () =>
-      [...positions]
-        .filter((p) => p.quantity !== 0)
-        .sort((a, b) => Math.abs(b.pnl) - Math.abs(a.pnl))
-        .slice(0, 6),
-    [positions]
-  );
-
-  return (
-    <Card className="flex flex-col">
-      <CardHeader className="flex flex-row items-center justify-between gap-2 pb-3">
-        <div>
-          <CardTitle className="text-sm font-semibold tracking-tight">
-            Open Positions
-          </CardTitle>
-          <p className="text-[11px] text-muted-foreground">
-            Sorted by absolute P&amp;L
-          </p>
-        </div>
-        <Link
-          to="/positions"
-          className="text-[11px] font-medium tracking-tight text-muted-foreground hover:text-foreground"
-        >
-          View all →
-        </Link>
-      </CardHeader>
-      <CardContent className="flex-1 pt-0">
-        {isLoading ? (
-          <SkeletonRows />
-        ) : sorted.length === 0 ? (
-          <EmptyState
-            title="No open positions"
-            hint="Place an order to see live P&L here."
-          />
-        ) : (
-          <ul className="divide-y divide-border/60">
-            {sorted.map((p) => (
-              <li
-                key={`${p.symbol}-${p.exchange}-${p.product}`}
-                className="flex items-center justify-between gap-3 py-2.5"
-              >
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2">
-                    <span className="truncate text-sm font-semibold tracking-tight">
-                      {p.symbol}
-                    </span>
-                    <span className="rounded border border-border/70 bg-muted/40 px-1 py-0.5 text-[9px] font-medium uppercase tracking-[0.1em] text-muted-foreground">
-                      {p.exchange}
-                    </span>
-                    <span className="rounded border border-border/70 bg-muted/40 px-1 py-0.5 text-[9px] font-medium uppercase tracking-[0.1em] text-muted-foreground">
-                      {p.product}
-                    </span>
-                  </div>
-                  <p className="mt-0.5 text-[11px] text-muted-foreground tabular-nums">
-                    {p.quantity > 0 ? "LONG" : "SHORT"}{" "}
-                    {Math.abs(p.quantity).toLocaleString("en-IN")} · avg{" "}
-                    {p.average_price.toFixed(2)} · ltp {p.ltp.toFixed(2)}
-                  </p>
-                </div>
-                <div className="text-right">
-                  <p
-                    className={cn(
-                      "text-sm font-semibold tabular-nums",
-                      pnlColor(p.pnl)
-                    )}
-                  >
-                    {withSign(p.pnl, formatCompactINR)}
-                  </p>
-                </div>
-              </li>
-            ))}
-          </ul>
-        )}
-      </CardContent>
-    </Card>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Section: Active strategies
-// ---------------------------------------------------------------------------
-
-function StrategiesSnapshot({
-  strategies,
-  isLoading,
-}: {
-  strategies: StrategyListItem[];
-  isLoading: boolean;
-}) {
-  const ranked = useMemo(
-    () =>
-      [...strategies]
-        .sort((a, b) => {
-          // Running first, then by abs pnl
-          const aRun = a.status === "running" ? 1 : 0;
-          const bRun = b.status === "running" ? 1 : 0;
-          if (aRun !== bRun) return bRun - aRun;
-          return Math.abs(b.pnl_total) - Math.abs(a.pnl_total);
-        })
-        .slice(0, 5),
-    [strategies]
-  );
-
-  const statusToneMap: Record<string, { dot: string; label: string }> = {
-    running: { dot: "bg-emerald-500 animate-pulse", label: "Running" },
-    paused: { dot: "bg-amber-500", label: "Paused" },
-    errored: { dot: "bg-rose-500", label: "Error" },
-    stopped: { dot: "bg-muted-foreground/40", label: "Idle" },
-  };
-
-  return (
-    <Card className="flex flex-col">
-      <CardHeader className="flex flex-row items-center justify-between gap-2 pb-3">
-        <div>
-          <CardTitle className="text-sm font-semibold tracking-tight">
-            Strategies
-          </CardTitle>
-          <p className="text-[11px] text-muted-foreground">
-            Live runtime + cumulative P&amp;L
-          </p>
-        </div>
-        <Link
-          to="/strategy"
-          className="text-[11px] font-medium tracking-tight text-muted-foreground hover:text-foreground"
-        >
-          View all →
-        </Link>
-      </CardHeader>
-      <CardContent className="flex-1 pt-0">
-        {isLoading ? (
-          <SkeletonRows />
-        ) : ranked.length === 0 ? (
-          <EmptyState
-            title="No strategies yet"
-            hint="Author your first strategy from Strategies → Strategy Builder."
-            cta={{ label: "Build a strategy", to: "/tools/strategybuilder" }}
-          />
-        ) : (
-          <ul className="divide-y divide-border/60">
-            {ranked.map((s) => {
-              const tone = statusToneMap[s.status] || statusToneMap.stopped;
-              return (
-                <li
-                  key={s.id}
-                  className="flex items-center justify-between gap-3 py-2.5"
-                >
-                  <Link
-                    to={`/strategy/${s.id}`}
-                    className="min-w-0 flex-1 group"
-                  >
-                    <div className="flex items-center gap-2">
-                      <span
-                        className={cn(
-                          "inline-block h-1.5 w-1.5 shrink-0 rounded-full",
-                          tone.dot
-                        )}
-                        aria-hidden
-                      />
-                      <span className="truncate text-sm font-semibold tracking-tight group-hover:underline">
-                        {s.name}
-                      </span>
-                      {s.live_enabled && (
-                        <span className="rounded border border-emerald-500/40 bg-emerald-500/10 px-1 py-0.5 text-[9px] font-semibold uppercase tracking-[0.1em] text-emerald-600 dark:text-emerald-400">
-                          Live
-                        </span>
-                      )}
-                    </div>
-                    <p className="mt-0.5 text-[11px] text-muted-foreground">
-                      {s.underlying} · {s.strategy_type} · {tone.label}
-                    </p>
-                  </Link>
-                  <div className="text-right">
-                    <p
-                      className={cn(
-                        "text-sm font-semibold tabular-nums",
-                        pnlColor(s.pnl_total)
-                      )}
-                    >
-                      {withSign(s.pnl_total, formatCompactINR)}
-                    </p>
-                    <p className="text-[10px] text-muted-foreground tabular-nums">
-                      U {withSign(s.pnl_unrealized, formatCompactINR)}
-                    </p>
-                  </div>
-                </li>
-              );
-            })}
-          </ul>
-        )}
-      </CardContent>
-    </Card>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Section: Recent activity (orders + trades)
-// ---------------------------------------------------------------------------
-
-function RecentOrders({
-  orders,
-  isLoading,
-}: {
-  orders: OrderbookItem[];
-  isLoading: boolean;
-}) {
-  const recent = useMemo(() => orders.slice(0, 6), [orders]);
-
-  return (
-    <Card className="flex flex-col">
-      <CardHeader className="flex flex-row items-center justify-between gap-2 pb-3">
-        <div>
-          <CardTitle className="text-sm font-semibold tracking-tight">
-            Recent Orders
-          </CardTitle>
-          <p className="text-[11px] text-muted-foreground">
-            Latest entries from orderbook
-          </p>
-        </div>
-        <Link
-          to="/orderbook"
-          className="text-[11px] font-medium tracking-tight text-muted-foreground hover:text-foreground"
-        >
-          View all →
-        </Link>
-      </CardHeader>
-      <CardContent className="flex-1 pt-0">
-        {isLoading ? (
-          <SkeletonRows />
-        ) : recent.length === 0 ? (
-          <EmptyState title="No orders today" hint="New orders will appear here." />
-        ) : (
-          <ul className="divide-y divide-border/60">
-            {recent.map((o) => {
-              const tone = orderToneStyles[orderTone(o.order_status)];
-              return (
-                <li
-                  key={o.orderid}
-                  className="flex items-center justify-between gap-3 py-2.5"
-                >
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2">
-                      <span
-                        className={cn("inline-block h-1.5 w-1.5 shrink-0 rounded-full", tone.dot)}
-                        aria-hidden
-                      />
-                      <span className="truncate text-sm font-semibold tracking-tight">
-                        {o.symbol}
-                      </span>
-                      <span className={cn("text-[10px] font-semibold uppercase tracking-[0.1em]", actionTone(o.action))}>
-                        {o.action}
-                      </span>
-                    </div>
-                    <p className="mt-0.5 text-[11px] text-muted-foreground tabular-nums">
-                      {o.quantity}{" "}
-                      <span className="text-muted-foreground/70">@</span>{" "}
-                      {o.pricetype === "MARKET"
-                        ? "MKT"
-                        : o.price?.toFixed(2) ?? "—"}{" "}
-                      · {o.product}
-                    </p>
-                  </div>
-                  <span className={cn("text-[10px] font-semibold uppercase tracking-[0.1em]", tone.label)}>
-                    {o.order_status}
-                  </span>
-                </li>
-              );
-            })}
-          </ul>
-        )}
-      </CardContent>
-    </Card>
-  );
-}
-
-function RecentTrades({
-  trades,
-  isLoading,
-}: {
-  trades: TradebookItem[];
-  isLoading: boolean;
-}) {
-  const recent = useMemo(() => trades.slice(0, 6), [trades]);
-
-  return (
-    <Card className="flex flex-col">
-      <CardHeader className="flex flex-row items-center justify-between gap-2 pb-3">
-        <div>
-          <CardTitle className="text-sm font-semibold tracking-tight">
-            Recent Trades
-          </CardTitle>
-          <p className="text-[11px] text-muted-foreground">Executed fills</p>
-        </div>
-        <Link
-          to="/tradebook"
-          className="text-[11px] font-medium tracking-tight text-muted-foreground hover:text-foreground"
-        >
-          View all →
-        </Link>
-      </CardHeader>
-      <CardContent className="flex-1 pt-0">
-        {isLoading ? (
-          <SkeletonRows />
-        ) : recent.length === 0 ? (
-          <EmptyState
-            title="No trades yet"
-            hint="Filled orders will land here as trades."
-          />
-        ) : (
-          <ul className="divide-y divide-border/60">
-            {recent.map((t) => (
-              <li
-                key={`${t.orderid}-${t.symbol}`}
-                className="flex items-center justify-between gap-3 py-2.5"
-              >
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2">
-                    <span className="truncate text-sm font-semibold tracking-tight">
-                      {t.symbol}
-                    </span>
-                    <span className={cn("text-[10px] font-semibold uppercase tracking-[0.1em]", actionTone(t.action))}>
-                      {t.action}
-                    </span>
-                  </div>
-                  <p className="mt-0.5 text-[11px] text-muted-foreground tabular-nums">
-                    {t.quantity}{" "}
-                    <span className="text-muted-foreground/70">@</span>{" "}
-                    {t.average_price.toFixed(2)} · {t.product}
-                  </p>
-                </div>
-                <p className="text-[11px] font-medium text-muted-foreground tabular-nums">
-                  {formatCompactINR(t.trade_value)}
-                </p>
-              </li>
-            ))}
-          </ul>
-        )}
-      </CardContent>
-    </Card>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Section: Quick actions + market clock
-// ---------------------------------------------------------------------------
-
-const quickActions: Array<{
-  label: string;
-  to: string;
-  hint: string;
-}> = [
-  { label: "Option Chain", to: "/tools/optionchain", hint: "Strikes, OI, IV" },
-  { label: "OI Tracker", to: "/tools/oitracker", hint: "Intraday OI shifts" },
-  { label: "Max Pain", to: "/tools/maxpain", hint: "Expiry magnet" },
-  { label: "Strategy Builder", to: "/tools/strategybuilder", hint: "Payoff design" },
-  { label: "GEX Dashboard", to: "/tools/gex", hint: "Dealer gamma" },
-  { label: "Search Symbol", to: "/search", hint: "⌘K shortcut" },
-];
-
-function QuickActions() {
-  return (
-    <Card>
-      <CardHeader className="pb-3">
-        <CardTitle className="text-sm font-semibold tracking-tight">
-          Quick Actions
-        </CardTitle>
-        <p className="text-[11px] text-muted-foreground">
-          Common tools, one tap away
-        </p>
-      </CardHeader>
-      <CardContent className="pt-0">
-        <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
-          {quickActions.map((a) => (
-            <Link
-              key={a.to}
-              to={a.to}
-              className={cn(
-                "group flex flex-col gap-1 rounded-lg border border-border bg-muted/30 px-3 py-2.5 transition-colors",
-                "hover:border-foreground/30 hover:bg-muted",
-                "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-              )}
-            >
-              <span className="text-[13px] font-semibold tracking-tight text-foreground">
-                {a.label}
-              </span>
-              <span className="text-[10px] text-muted-foreground">{a.hint}</span>
-            </Link>
-          ))}
-        </div>
-      </CardContent>
-    </Card>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Section: Market clock — Asia/Kolkata, NSE hours
-// ---------------------------------------------------------------------------
-
-function MarketClock() {
-  const [now, setNow] = useState(() => new Date());
   useEffect(() => {
-    const tick = setInterval(() => setNow(new Date()), 1000);
-    return () => clearInterval(tick);
-  }, []);
-
-  // Format IST regardless of user's local TZ
-  const ist = new Intl.DateTimeFormat("en-IN", {
-    timeZone: "Asia/Kolkata",
-    weekday: "short",
-    day: "2-digit",
-    month: "short",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  }).format(now);
-
-  // Determine market session for NSE F&O equity (9:15–15:30 IST, Mon–Fri)
-  const istParts = new Intl.DateTimeFormat("en-GB", {
-    timeZone: "Asia/Kolkata",
-    weekday: "short",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  })
-    .formatToParts(now)
-    .reduce<Record<string, string>>((acc, p) => {
-      acc[p.type] = p.value;
-      return acc;
-    }, {});
-  const istWeekday = istParts.weekday;
-  const istHour = parseInt(istParts.hour || "0", 10);
-  const istMin = parseInt(istParts.minute || "0", 10);
-  const minutesSinceMidnight = istHour * 60 + istMin;
-  const isWeekend = istWeekday === "Sat" || istWeekday === "Sun";
-
-  let session: { dot: string; label: string; hint: string };
-  if (isWeekend) {
-    session = {
-      dot: "bg-muted-foreground/40",
-      label: "Markets closed",
-      hint: "Weekend",
-    };
-  } else if (minutesSinceMidnight < 9 * 60) {
-    session = {
-      dot: "bg-muted-foreground/50",
-      label: "Pre-open",
-      hint: "Markets open at 09:15 IST",
-    };
-  } else if (minutesSinceMidnight < 9 * 60 + 15) {
-    session = {
-      dot: "bg-amber-500 animate-pulse",
-      label: "Pre-open auction",
-      hint: "Cash auction 09:00–09:15",
-    };
-  } else if (minutesSinceMidnight < 15 * 60 + 30) {
-    session = {
-      dot: "bg-emerald-500 animate-pulse",
-      label: "Market open",
-      hint: "Closes at 15:30 IST",
-    };
-  } else {
-    session = {
-      dot: "bg-rose-500",
-      label: "Market closed",
-      hint: "Reopens 09:15 IST",
-    };
-  }
-
-  return (
-    <Card>
-      <CardHeader className="pb-3">
-        <CardTitle className="text-sm font-semibold tracking-tight">
-          Market Clock
-        </CardTitle>
-        <p className="text-[11px] text-muted-foreground">NSE — Asia/Kolkata</p>
-      </CardHeader>
-      <CardContent className="pt-0">
-        <div className="flex items-center gap-2">
-          <span
-            className={cn("inline-block h-2 w-2 rounded-full", session.dot)}
-            aria-hidden
-          />
-          <span className="text-[12px] font-semibold uppercase tracking-[0.12em]">
-            {session.label}
-          </span>
-        </div>
-        <p className="mt-2 font-mono text-xl font-bold tracking-tight tabular-nums sm:text-2xl">
-          {ist}
-        </p>
-        <p className="mt-0.5 text-[11px] text-muted-foreground">
-          {session.hint}
-        </p>
-      </CardContent>
-    </Card>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Small helpers
-// ---------------------------------------------------------------------------
-
-function SkeletonRows() {
-  return (
-    <ul className="divide-y divide-border/60">
-      {Array.from({ length: 4 }).map((_, i) => (
-        <li key={i} className="flex items-center justify-between gap-3 py-2.5">
-          <div className="flex-1 space-y-1.5">
-            <div className="h-3 w-2/3 animate-pulse rounded bg-muted" />
-            <div className="h-2.5 w-1/3 animate-pulse rounded bg-muted/70" />
-          </div>
-          <div className="h-3 w-12 animate-pulse rounded bg-muted" />
-        </li>
-      ))}
-    </ul>
-  );
-}
-
-function EmptyState({
-  title,
-  hint,
-  cta,
-}: {
-  title: string;
-  hint: string;
-  cta?: { label: string; to: string };
-}) {
-  return (
-    <div className="flex flex-col items-start gap-2 rounded-md border border-dashed border-border/70 bg-muted/30 px-4 py-5">
-      <p className="text-sm font-semibold tracking-tight text-foreground">
-        {title}
-      </p>
-      <p className="text-[11px] text-muted-foreground">{hint}</p>
-      {cta && (
-        <Link
-          to={cta.to}
-          className="mt-1 text-[11px] font-medium tracking-tight text-foreground underline-offset-2 hover:underline"
-        >
-          {cta.label} →
-        </Link>
-      )}
+    if (!target.current) return;
+    const style = getComputedStyle(target.current);
+    const chart = createChart(target.current, {
+      width: target.current.clientWidth, height: 230,
+      layout: { background: { type: ColorType.Solid, color: chartColor(style.backgroundColor) }, textColor: chartColor(style.color) },
+      grid: { vertLines: { visible: false }, horzLines: { color: "rgba(148,163,184,0.12)" } },
+      timeScale: { timeVisible: true, secondsVisible: false, borderVisible: false },
+      rightPriceScale: { borderVisible: false },
+    });
+    const series = chart.addSeries(LineSeries, { color: "#818cf8", lineWidth: 2, priceLineVisible: false });
+    chartState.current = { chart, series, fitted: false };
+    const resize = new ResizeObserver(([entry]) => {
+      if (entry.contentRect.width <= 0) return;
+      chart.applyOptions({ width: entry.contentRect.width });
+      chart.timeScale().fitContent();
+    });
+    resize.observe(target.current);
+    return () => { resize.disconnect(); chartState.current = null; chart.remove(); };
+  }, [instrument.symbol, instrument.exchange]);
+  useEffect(() => {
+    const state = chartState.current;
+    if (!state || !query.data) return;
+    state.series.setData(query.data.map(point => ({ ...point, time: point.time as UTCTimestamp })));
+    if (!state.fitted) { state.chart.timeScale().fitContent(); state.fitted = true; }
+  }, [query.data, instrument.symbol, instrument.exchange]);
+  return <section className="rounded-xl border border-border bg-card p-4 sm:p-5">
+    <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+      <div><h2 className="font-semibold">{instrument.name}</h2><p className="text-xs text-muted-foreground">Synthetic price history · Two hours · Chart times in UTC</p></div>
+      <span className="text-lg font-semibold tabular-nums">{money(instrument.ltp)}</span>
     </div>
-  );
+    {query.isLoading && <p className="text-sm text-muted-foreground">Loading demo chart…</p>}
+    {query.isError && <p role="alert" className="text-sm text-destructive">{errorMessage(query.error)}</p>}
+    <div ref={target} className="h-[230px] w-full bg-card text-muted-foreground" aria-label={instrument.name + " synthetic price chart"} />
+  </section>;
 }
-
-// ---------------------------------------------------------------------------
-// Main Dashboard
-// ---------------------------------------------------------------------------
 
 export default function Dashboard() {
-  const navigate = useNavigate();
-  const { funds, positions, holdings, orders, trades, strategies } =
-    useDashboardData();
-
-  if (funds.isLoading) {
-    return (
-      <div className="flex items-center justify-center py-20">
-        <div className="flex flex-col items-center gap-4">
-          <div className="h-8 w-8 animate-spin rounded-full border-4 border-muted border-t-primary" />
-          <p className="text-sm text-muted-foreground">Loading dashboard…</p>
-        </div>
-      </div>
-    );
-  }
-
-  if (funds.error) {
-    return (
-      <div className="flex items-center justify-center py-20">
-        <div className="rounded-md bg-destructive/10 p-4 text-sm text-destructive">
-          Failed to load dashboard data. Please try again.
-        </div>
-      </div>
-    );
-  }
-
-  const f = funds.data;
-
-  const fundCards = [
-    { label: "Available Cash", value: f?.availablecash ?? 0, isPnl: false },
-    { label: "Collateral", value: f?.collateral ?? 0, isPnl: false },
-    { label: "M2M Unrealized", value: f?.m2munrealized ?? 0, isPnl: true },
-    { label: "M2M Realized", value: f?.m2mrealized ?? 0, isPnl: true },
-    { label: "Utilized Debits", value: f?.utiliseddebits ?? 0, isPnl: false },
-  ];
-
-  const positionsData = positions.data ?? [];
-  const holdingsData = holdings.data ?? [];
-  const ordersData = orders.data ?? [];
-  const tradesData = trades.data ?? [];
-  const strategiesData = strategies.data ?? [];
-
-  const dayPnl = (f?.m2munrealized ?? 0) + (f?.m2mrealized ?? 0);
-  const openPositions = positionsData.filter((p) => p.quantity !== 0).length;
-  const runningStrategies = strategiesData.filter(
-    (s) => s.status === "running"
-  ).length;
-
-  return (
-    <div className="space-y-6">
-      {/* Page header */}
-      <div className="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
-        <div>
-          <h1 className="text-2xl font-bold tracking-tight sm:text-3xl">
-            Dashboard
-          </h1>
-          <p className="text-sm text-muted-foreground">
-            Overview of your trading account
-          </p>
-        </div>
-        <button
-          type="button"
-          onClick={() => navigate("/search")}
-          className="hidden text-[11px] font-medium tracking-tight text-muted-foreground hover:text-foreground sm:inline"
-        >
-          Press ⌘K to search symbols
-        </button>
-      </div>
-
-      {/* Funds — primary tile grid */}
-      <div className="grid gap-3 sm:gap-4 grid-cols-2 sm:grid-cols-3 lg:grid-cols-5">
-        {fundCards.map((card) => (
-          <Card key={card.label}>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
-                {card.label}
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <p
-                className={cn(
-                  "text-lg font-bold tracking-tight tabular-nums sm:text-xl lg:text-2xl",
-                  card.isPnl ? pnlColor(card.value) : "text-foreground"
-                )}
-              >
-                {formatCurrency(card.value)}
-              </p>
-            </CardContent>
-          </Card>
-        ))}
-      </div>
-
-      {/* KPI strip */}
-      <KpiStrip
-        dayPnl={dayPnl}
-        openPositions={openPositions}
-        holdingsCount={holdingsData.length}
-        runningStrategies={runningStrategies}
-        totalStrategies={strategiesData.length}
-      />
-
-      {/* Positions + Strategies */}
-      <div className="grid gap-4 lg:grid-cols-2">
-        <PositionsSnapshot
-          positions={positionsData}
-          isLoading={positions.isLoading}
-        />
-        <StrategiesSnapshot
-          strategies={strategiesData}
-          isLoading={strategies.isLoading}
-        />
-      </div>
-
-      {/* Recent activity */}
-      <div className="grid gap-4 lg:grid-cols-2">
-        <RecentOrders orders={ordersData} isLoading={orders.isLoading} />
-        <RecentTrades trades={tradesData} isLoading={trades.isLoading} />
-      </div>
-
-      {/* Quick actions + market clock */}
-      <div className="grid gap-4 lg:grid-cols-[2fr_1fr]">
-        <QuickActions />
-        <MarketClock />
-      </div>
+  const [group, setGroup] = useState("All markets");
+  const [chartSymbol, setChartSymbol] = useState("NIFTY-DEMO-FUT");
+  const [ticket, setTicket] = useState<{ instrument: Instrument; action: "BUY" | "SELL" } | null>(null);
+  const client = useQueryClient();
+  const market = useQuery({
+    queryKey: ["paper-market"], queryFn: async () => (await api.get<Market>("/web/paper/market")).data,
+    refetchInterval: 2000, retry: false,
+  });
+  const funds = useQuery({ queryKey: ["dashboard"], queryFn: getDashboard, refetchInterval: 3000 });
+  const positions = useQuery({ queryKey: ["positions"], queryFn: getPositions, refetchInterval: 3000 });
+  const online = useSyncExternalStore(onlineManager.subscribe.bind(onlineManager), onlineManager.isOnline.bind(onlineManager), () => true);
+  const now = useNow();
+  const pricesPaused = !online || market.fetchStatus === "paused" || !market.dataUpdatedAt || now - market.dataUpdatedAt > 6000;
+  const rows = market.data?.instruments ?? [];
+  const groups = ["All markets", ...new Set(rows.map(row => row.group))];
+  const activeGroup = groups.includes(group) ? group : "All markets";
+  const selected = rows.find(row => row.symbol === chartSymbol) ?? rows[0];
+  const active = positions.data?.filter(row => row.quantity !== 0) ?? [];
+  const refreshBooks = () => { for (const key of ["dashboard", "positions", "orderbook", "tradebook"]) void client.invalidateQueries({ queryKey: [key] }); };
+  return <div className="space-y-6">
+    <div className="flex flex-wrap items-end justify-between gap-3">
+      <div><h1 className="text-2xl font-semibold tracking-tight sm:text-3xl">Trading desk</h1>
+        <p className="mt-1 text-sm text-muted-foreground">Practice a trade, track your position, and build confidence.</p></div>
+      <span className="text-xs text-muted-foreground">{pricesPaused ? "Demo prices paused" : "Demo feed · Updates every 2 seconds"}</span>
     </div>
-  );
+    {pricesPaused && market.data && <p role="alert" className="rounded-lg border border-border bg-muted p-3 text-sm">Prices paused — reconnecting. New orders are unavailable until fresh prices return.</p>}
+    {(funds.isError || market.isError || positions.isError) && <div role="alert" className="rounded-lg border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
+      {errorMessage(funds.error ?? market.error ?? positions.error)}
+      <Button className="ml-3" size="sm" variant="outline" onClick={() => { void funds.refetch(); void market.refetch(); void positions.refetch(); }}>Retry</Button>
+    </div>}
+    <dl className="grid grid-cols-2 gap-x-5 gap-y-5 rounded-xl border border-border bg-card p-5 lg:grid-cols-4">
+      {[
+        ["Available virtual funds", funds.data?.availablecash],
+        ["Margin in use", funds.data?.utiliseddebits],
+        ["Open P&L", funds.data?.m2munrealized],
+        ["Net realized P&L", funds.data?.m2mrealized],
+      ].map(([label, value]) => <div key={String(label)}>
+        <dt className="text-xs text-muted-foreground">{label}</dt>
+        <dd className={cn("mt-2 text-xl font-semibold tracking-tight tabular-nums sm:text-2xl",
+          String(label).includes("P&L") && typeof value === "number" && (value < 0 ? "text-red-700" : value > 0 ? "text-emerald-700" : ""))}>
+          {typeof value === "number" ? money(value) : "—"}
+        </dd>
+      </div>)}
+    </dl>
+    {funds.data && <p className="text-sm text-muted-foreground">Brokerage paid since last reset: {money(funds.data.brokerage_paid)} · Realized P&L includes these charges.</p>}
+    <section className="rounded-xl border border-border bg-card">
+      <div className="p-4 sm:p-5"><h2 className="font-semibold">Market watch</h2>
+        <p className="mt-1 text-xs text-muted-foreground">Sample contracts. Select an instrument to view its chart.</p>
+        <div role="group" aria-label="Market category" className="mt-4 flex flex-wrap gap-2">
+          {groups.map(name => <Button key={name} size="sm" variant={activeGroup === name ? "default" : "outline"} aria-pressed={activeGroup === name} onClick={() => setGroup(name)}>{name}</Button>)}
+        </div>
+      </div>
+      {market.isError && !market.data ? <p role="alert" className="px-5 py-8 text-sm text-destructive">Market watch is unavailable. Use Retry above to reconnect.</p> : market.isLoading ? <p className="px-5 py-8 text-sm text-muted-foreground">Loading demo instruments…</p> :
+        <div className="relative overflow-x-auto"><table className="w-full text-sm">
+          <caption className="sr-only">Demo instruments and paper order actions</caption>
+          <thead className="border-y border-border bg-muted/40 text-xs text-muted-foreground">
+            <tr><th className="px-4 py-3 text-left font-medium">Instrument</th><th className="px-3 py-3 text-right font-medium">Demo price</th>
+              <th className="hidden px-3 py-3 text-right font-medium sm:table-cell">Change</th><th className="hidden px-3 py-3 text-right font-medium md:table-cell">Demo lot</th>
+              <th className="px-4 py-3 text-right font-medium">Paper order</th></tr>
+          </thead>
+          <tbody className="divide-y divide-border">
+            {rows.length === 0 && !market.isError && <tr><td colSpan={5} className="px-5 py-8 text-muted-foreground">No instruments are enabled. Your existing positions remain available in Positions.</td></tr>}
+            {rows.filter(row => activeGroup === "All markets" || row.group === activeGroup).map(row => <tr key={row.symbol} className={cn("hover:bg-muted/30", selected?.symbol === row.symbol && "bg-primary/5")}>
+              <td className="px-4 py-3"><button className="text-left font-medium underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-ring" onClick={() => setChartSymbol(row.symbol)}>
+                {row.name}<span className="mt-0.5 block text-xs font-normal text-muted-foreground">{row.exchange} · {row.symbol}</span>
+              </button></td>
+              <td className="whitespace-nowrap px-3 py-3 text-right font-medium tabular-nums">₹{formatPrice(row.ltp)}</td>
+              <td className={cn("hidden px-3 py-3 text-right tabular-nums sm:table-cell", row.change_percent < 0 ? "text-red-700" : "text-emerald-700")}>{row.change_percent > 0 ? "+" : ""}{row.change_percent.toFixed(2)}%</td>
+              <td className="hidden px-3 py-3 text-right tabular-nums md:table-cell">{row.lot}</td>
+              <td className="px-4 py-3"><div className="flex justify-end gap-2">
+                <Button size="sm" className="bg-emerald-700 text-white hover:bg-emerald-800" disabled={pricesPaused} aria-label={"Buy " + row.name} onClick={() => setTicket({ instrument: row, action: "BUY" })}>Buy</Button>
+                <Button size="sm" variant="outline" disabled={pricesPaused} aria-label={"Sell " + row.name} onClick={() => setTicket({ instrument: row, action: "SELL" })}>Sell</Button>
+              </div></td>
+            </tr>)}
+          </tbody>
+        </table></div>}
+    </section>
+    <section className="rounded-xl border border-border bg-card p-4 sm:p-5">
+      <div className="flex items-center justify-between gap-3"><h2 className="font-semibold">Your open positions</h2><Link to="/positions" className="text-sm text-primary underline underline-offset-4">Manage positions</Link></div>
+      {positions.isLoading ? <p className="py-6 text-sm text-muted-foreground">Loading positions…</p> : active.length === 0 ?
+        <p className="py-6 text-sm text-muted-foreground">Your first filled paper order will appear here. Choose Buy or Sell in Market watch.</p> :
+        <ul className="mt-4 divide-y divide-border">{active.map(row => <li key={row.symbol + row.product} className="flex flex-wrap justify-between gap-2 py-3 text-sm">
+          <div><span className="font-medium">{row.symbol}</span><span className="ml-2 text-muted-foreground">{row.quantity} units · {row.product}</span></div>
+          <span className={cn("font-semibold tabular-nums", row.pnl < 0 ? "text-red-700" : "text-emerald-700")}>{money(row.pnl)}</span>
+        </li>)}</ul>}
+    </section>
+    {selected && <PriceChart instrument={selected} />}
+    <ReferencePrices />
+    {ticket && <PlaceOrderDialog open onOpenChange={open => { if (!open) setTicket(null); }} symbol={ticket.instrument.symbol}
+      exchange={ticket.instrument.exchange} action={ticket.action} ltp={ticket.instrument.ltp}
+      lotSize={ticket.instrument.lot} tickSize={ticket.instrument.tick} strategy="PaperDesk" onSuccess={refreshBooks} disabled={pricesPaused} />}
+  </div>;
 }

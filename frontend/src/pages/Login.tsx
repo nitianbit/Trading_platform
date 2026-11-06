@@ -1,3 +1,4 @@
+import { errorMessage } from "@/lib/apiError";
 import { useState, useEffect } from "react";
 import type { FormEvent } from "react";
 import { useNavigate, Link } from "react-router-dom";
@@ -19,7 +20,7 @@ export default function Login() {
 
   useEffect(() => {
     if (user) {
-      navigate(user.broker_authenticated ? "/dashboard" : "/broker/select");
+      navigate(user.role !== "user" ? "/admin" : "/dashboard");
     }
   }, [user, navigate]);
 
@@ -36,14 +37,9 @@ export default function Login() {
 
     try {
       const userInfo = await login({ username, password });
-      if (userInfo.broker_authenticated) {
-        navigate("/dashboard");
-      } else {
-        navigate("/broker/select");
-      }
+      navigate(userInfo.role !== "user" ? "/admin" : "/dashboard");
     } catch (err: unknown) {
-      const axiosErr = err as { response?: { data?: { detail?: string } } };
-      setError(axiosErr.response?.data?.detail ?? "Login failed. Please try again.");
+      setError(errorMessage(err));
     } finally {
       setSubmitting(false);
     }
@@ -53,8 +49,8 @@ export default function Login() {
     <div className="flex min-h-screen items-center justify-center bg-background px-4">
       <Card className="w-full max-w-md">
         <CardHeader className="text-center">
-          <CardTitle className="text-2xl">OpenBull</CardTitle>
-          <CardDescription>Sign in to your account</CardDescription>
+          <CardTitle className="text-2xl">DHK Paper</CardTitle>
+          <CardDescription>Sign in to your activated account</CardDescription>
         </CardHeader>
         <CardContent>
           <form onSubmit={handleSubmit} className="space-y-4">
@@ -98,11 +94,12 @@ export default function Login() {
               {submitting ? "Signing in..." : "Sign In"}
             </Button>
 
+            <p className="text-center text-sm text-muted-foreground">New user? Ask your broker for an invitation link.</p>
             {needsSetup && (
               <p className="text-center text-sm text-muted-foreground">
                 First time?{" "}
                 <Link to="/setup" className="font-medium text-primary underline underline-offset-4">
-                  Set up your account
+                  Super Admin setup
                 </Link>
               </p>
             )}

@@ -1,3 +1,4 @@
+import { formatPrice } from "@/lib/price";
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
@@ -129,8 +130,11 @@ export default function TradeBook() {
       { header: "Action", value: (r) => r.action },
       { header: "Product", value: (r) => r.product },
       { header: "Quantity", value: (r) => r.quantity },
-      { header: "Average Price", value: (r) => r.average_price.toFixed(2) },
+      { header: "Average Price", value: (r) => formatPrice(r.average_price) },
       { header: "Trade Value", value: (r) => r.trade_value.toFixed(2) },
+      { header: "Brokerage", value: (r) => r.brokerage.toFixed(2) },
+      { header: "Broker Credit", value: (r) => r.broker_credit.toFixed(2) },
+      { header: "Admin Credit", value: (r) => r.admin_credit.toFixed(2) },
     ];
     downloadCsv({ filename: "tradebook", columns, rows });
   };
@@ -141,7 +145,7 @@ export default function TradeBook() {
         <div>
           <h1 className="text-2xl font-bold tracking-tight">Tradebook</h1>
           <p className="text-sm text-muted-foreground">
-            View all executed trades
+            Fees below cover this trading session. Dashboard brokerage covers all sessions since the last reset.
           </p>
         </div>
         <Button
@@ -206,6 +210,9 @@ export default function TradeBook() {
                   >
                     Trade Value
                   </SortableHead>
+                  <th scope="col" className="px-3 py-2 text-right text-xs font-medium">Brokerage</th>
+                  <th scope="col" className="px-3 py-2 text-right text-xs font-medium">Broker credit</th>
+                  <th scope="col" className="px-3 py-2 text-right text-xs font-medium">Admin credit</th>
                   <SortableHead
                     sortKey="orderid"
                     current={sort}
@@ -233,8 +240,8 @@ export default function TradeBook() {
                       <span
                         className={
                           trade.action.toUpperCase() === "BUY"
-                            ? "font-medium text-green-600 dark:text-green-400"
-                            : "font-medium text-red-600 dark:text-red-400"
+                            ? "font-medium text-green-700"
+                            : "font-medium text-red-700"
                         }
                       >
                         {trade.action}
@@ -243,11 +250,14 @@ export default function TradeBook() {
                     <TableCell>{trade.product}</TableCell>
                     <TableCell className="text-right">{trade.quantity}</TableCell>
                     <TableCell className="text-right">
-                      {trade.average_price.toFixed(2)}
+                      {formatPrice(trade.average_price)}
                     </TableCell>
                     <TableCell className="text-right">
                       {trade.trade_value.toFixed(2)}
                     </TableCell>
+                    <TableCell className="text-right tabular-nums">{trade.brokerage.toFixed(2)}</TableCell>
+                    <TableCell className="text-right tabular-nums">{trade.broker_credit.toFixed(2)}</TableCell>
+                    <TableCell className="text-right tabular-nums">{trade.admin_credit.toFixed(2)}</TableCell>
                     <TableCell>
                       {trade.orderid ? (
                         <button

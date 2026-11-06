@@ -2,7 +2,7 @@
 Weekly wipe of sandbox state.
 
 If ``sandbox_config.reset_day`` is ``"Never"`` this is disabled. Otherwise on
-the configured day (``Sunday`` by default) at ``reset_time`` IST we reset
+the explicitly configured day at ``reset_time`` IST we reset
 every user's sandbox to the current ``starting_capital`` — orders, trades,
 positions, holdings, daily P&L are all deleted, funds restored.
 
@@ -31,27 +31,28 @@ from backend.sandbox import fund_manager
 logger = logging.getLogger(__name__)
 
 
+def reset_user(user_id: int) -> None:
+    """Reset one account atomically with the same lock used for trading."""
+    from backend.sandbox.config import get_starting_capital
+    with session_scope() as db:
+        funds = fund_manager.ensure_fund_row(db, user_id)
+        for model in (SandboxOrder, SandboxTrade, SandboxPosition, SandboxHolding, SandboxDailyPnL):
+            db.execute(delete(model).where(model.user_id == user_id))
+        capital = get_starting_capital(db)
+        funds.starting_capital = capital
+        funds.available = capital
+        funds.used_margin = 0.0
+        funds.realized_pnl = 0.0
+        funds.today_realized_pnl = 0.0
+        funds.unrealized_pnl = 0.0
+        funds.brokerage_paise = 0
+
+
 def wipe_all_users() -> int:
-    """Reset every user that has any sandbox state. Returns users affected."""
-    users: set[int] = set()
+    users = set()
     with session_scope() as db:
         for model in (SandboxFund, SandboxOrder, SandboxTrade, SandboxPosition, SandboxHolding):
-            for uid in db.execute(select(model.user_id).distinct()).scalars().all():
-                users.add(int(uid))
-
-        if not users:
-            return 0
-
-        # Bulk-delete first; per-user fund reset after the transaction commits
-        # (fund_manager opens its own sessions).
-        for model in (SandboxOrder, SandboxTrade, SandboxPosition, SandboxHolding, SandboxDailyPnL):
-            db.execute(delete(model))
-
-    for uid in users:
-        try:
-            fund_manager.reset_funds(uid)
-        except Exception:
-            logger.exception("Weekly reset: funds reset failed for user %d", uid)
-
-    logger.info("sandbox weekly reset: wiped %d users", len(users))
+            users.update(db.scalars(select(model.user_id).distinct()))
+    for user_id in sorted(users):
+        reset_user(user_id)
     return len(users)

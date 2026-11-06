@@ -47,6 +47,7 @@ SENSITIVE_KEYS = {
     "refresh_token",
     "auth_token",
     "session_token",
+    "setup_token",
     "webhook_token",
     "totp",
     "pin",

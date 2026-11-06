@@ -1,5 +1,5 @@
 import api from "@/config/api";
-import { getApiKey } from "@/api/apikey";
+import { resolveApiKey } from "@/api/apikey";
 import type {
   ExpiryResponse,
   FnoExchange,
@@ -9,21 +9,7 @@ import type {
   UnderlyingsResponse,
 } from "@/types/optionchain";
 
-let cachedApiKey: string | null = null;
 
-async function resolveApiKey(): Promise<string> {
-  if (cachedApiKey) return cachedApiKey;
-  const { api_key } = await getApiKey();
-  if (!api_key) {
-    throw new Error("No API key found. Generate one on the API Key page first.");
-  }
-  cachedApiKey = api_key;
-  return api_key;
-}
-
-export function clearCachedApiKey(): void {
-  cachedApiKey = null;
-}
 
 export async function fetchOptionChain(params: {
   underlying: string;

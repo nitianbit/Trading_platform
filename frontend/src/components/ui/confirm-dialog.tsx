@@ -29,6 +29,7 @@ interface Props {
   /** Disable the confirm button while a mutation is in-flight. The caller
    *  is also expected to flip `open` to `false` once the mutation settles. */
   loading?: boolean;
+  confirmDisabled?: boolean;
   onConfirm: () => void;
 }
 
@@ -41,6 +42,7 @@ export function ConfirmDialog({
   cancelLabel = "Cancel",
   variant = "default",
   loading = false,
+  confirmDisabled = false,
   onConfirm,
 }: Props) {
   return (
@@ -63,7 +65,7 @@ export function ConfirmDialog({
           <Button
             variant={variant === "destructive" ? "destructive" : "default"}
             onClick={onConfirm}
-            disabled={loading}
+            disabled={loading || confirmDisabled}
             className={cn(variant === "destructive" && "min-w-[120px]")}
           >
             {loading ? "Working…" : confirmLabel}

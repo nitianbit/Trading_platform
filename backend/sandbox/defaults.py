@@ -6,7 +6,7 @@ defaults so strategies ported from there feel identical.
 DEFAULT_CONFIGS: list[tuple[str, str, str]] = [
     # (key, value, description)
     ("starting_capital", "10000000", "Default paper-trading capital (1 Cr INR)"),
-    ("reset_day", "Sunday", "Day of week to auto-reset sandbox (Never=off)"),
+    ("reset_day", "Never", "Day of week to auto-reset sandbox (Never=off)"),
     ("reset_time", "00:00", "IST time to run the weekly reset"),
 
     # Per-instrument leverage. ``leverage_mis / nrml / cnc`` are kept for

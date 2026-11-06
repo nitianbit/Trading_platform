@@ -41,45 +41,12 @@ def _cancel_pending_mis_orders(exchanges: Iterable[str]) -> int:
     a stale MIS limit could fill in the next session and silently open a
     fresh intraday position the user never authorised.
     """
-    exchanges = list(exchanges)
+    from backend.sandbox import order_manager
     cancelled = 0
-    margin_releases: dict[int, float] = {}
-
-    with session_scope() as db:
-        rows = (
-            db.execute(
-                select(SandboxOrder).where(
-                    SandboxOrder.product == "MIS",
-                    SandboxOrder.status.in_(("open", "trigger_pending")),
-                    SandboxOrder.exchange.in_(exchanges),
-                )
-            )
-            .scalars()
-            .all()
-        )
-        for o in rows:
-            margin = float(o.margin_blocked or 0.0)
-            if margin > 0:
-                margin_releases[o.user_id] = margin_releases.get(o.user_id, 0.0) + margin
-            o.status = "cancelled"
-            o.rejection_reason = "Auto-cancelled at MIS squareoff"
-            o.margin_blocked = 0.0
-            cancelled += 1
-
-    for uid, amount in margin_releases.items():
-        try:
-            fund_manager.release_margin(uid, amount, realized_pnl=0.0)
-        except Exception:
-            logger.exception(
-                "sandbox squareoff: release_margin failed for user=%d amount=%.2f",
-                uid, amount,
-            )
-
-    if cancelled:
-        logger.info(
-            "sandbox squareoff: cancelled %d pending MIS order(s) on %s",
-            cancelled, exchanges,
-        )
+    for row in order_manager.list_pending_orders():
+        if row.product == "MIS" and row.exchange in exchanges:
+            if order_manager.cancel_order(row.user_id, row.orderid, reason="Auto-cancelled at MIS squareoff"):
+                cancelled += 1
     return cancelled
 
 

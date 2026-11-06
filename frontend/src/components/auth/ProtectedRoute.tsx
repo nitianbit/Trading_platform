@@ -25,7 +25,7 @@ export function ProtectedRoute({ children, requiresBroker = false }: ProtectedRo
     return <Navigate to="/login" replace />;
   }
 
-  if (requiresBroker && !user.broker_authenticated) {
+  if (requiresBroker && !user.paper_only && !user.broker_authenticated) {
     return <Navigate to="/broker/select" replace />;
   }
 

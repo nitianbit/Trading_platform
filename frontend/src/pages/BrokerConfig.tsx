@@ -101,6 +101,7 @@ export default function BrokerConfig() {
 
   useEffect(() => {
     if (!selectedBroker) return;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- Hydrate the editable form when its external selection changes.
     setMessage("");
     setError("");
     getBrokerCredentials(selectedBroker)

@@ -175,6 +175,7 @@ export function TemplateConfigDialog({
         lots: Math.max(1, tl.lots),
       };
     });
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- Hydrate the editable form when its external selection changes.
     setRows(seeded);
   }, [template, open, chain, expiries, primaryExpiry, convertExpiryForApi]);
 

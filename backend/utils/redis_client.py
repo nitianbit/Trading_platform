@@ -16,7 +16,7 @@ from backend.config import get_settings
 
 logger = logging.getLogger(__name__)
 
-KEY_PREFIX = "openbull:"
+KEY_PREFIX = get_settings().redis_key_prefix
 
 _client: redis.Redis | None = None
 
@@ -33,7 +33,7 @@ def get_redis() -> redis.Redis:
             socket_connect_timeout=2,
             socket_timeout=2,
         )
-        logger.info("Redis client initialized at %s", settings.redis_url)
+        logger.info("Redis client initialized")
     return _client
 
 

@@ -43,6 +43,7 @@ function DialogContent({
   className,
   children,
   showCloseButton = true,
+  onKeyDown,
   ...props
 }: DialogPrimitive.Popup.Props & {
   showCloseButton?: boolean
@@ -57,6 +58,22 @@ function DialogContent({
           className
         )}
         {...props}
+        onKeyDown={event => {
+          onKeyDown?.(event);
+          if (event.defaultPrevented || event.key !== "Tab" || (event.target as HTMLElement).closest('[role="dialog"]') !== event.currentTarget) return;
+          // Base UI's focus guards hand off on the next animation frame.
+          // Wrap at the boundary synchronously so rapid Tab presses cannot
+          // advance through the guard into the page behind the modal.
+          const targets = Array.from(event.currentTarget.querySelectorAll<HTMLElement>(
+            'button, [href], input, select, textarea, [tabindex]'
+          )).filter(element => element.tabIndex >= 0 && !element.matches(':disabled, [aria-disabled="true"]') && element.getClientRects().length > 0);
+          const first = targets[0];
+          const last = targets.at(-1);
+          if ((!event.shiftKey && event.target === last) || (event.shiftKey && event.target === first)) {
+            event.preventDefault();
+            (event.shiftKey ? last : first)?.focus();
+          }
+        }}
       >
         {children}
         {showCloseButton && (

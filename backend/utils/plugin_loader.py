@@ -13,6 +13,8 @@ def load_all_plugins() -> dict:
     broker_dir = Path(__file__).parent.parent / "broker"
     for plugin_path in broker_dir.glob("*/plugin.json"):
         broker_name = plugin_path.parent.name
+        if broker_name != "demo":
+            continue
         try:
             with open(plugin_path, encoding="utf-8") as f:
                 data = json.load(f)

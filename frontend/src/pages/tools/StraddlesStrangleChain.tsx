@@ -463,7 +463,7 @@ export default function StraddlesStrangleChain() {
       };
       setBasketOpen(true);
     },
-    [strategy],
+    [strategy, setBasketOpen],
   );
 
   /** Open the basket dialog with reverse-direction legs to close a group. */
@@ -501,7 +501,7 @@ export default function StraddlesStrangleChain() {
     setBasketStrategy(`Close ${g.type}`);
     pendingBasketRef.current = null; // closes don't go into "Recent"
     setBasketOpen(true);
-  }, []);
+  }, [setBasketOpen]);
 
   /** Open the basket dialog with same-direction legs to add lots. */
   const openAdd = useCallback((g: ActiveGroup) => {
@@ -538,7 +538,7 @@ export default function StraddlesStrangleChain() {
     setBasketStrategy(`Add ${g.type}`);
     pendingBasketRef.current = null;
     setBasketOpen(true);
-  }, []);
+  }, [setBasketOpen]);
 
   /** Re-fire a recent basket using its persisted legs. */
   const openReopen = useCallback((b: RecentBasket) => {
@@ -558,7 +558,7 @@ export default function StraddlesStrangleChain() {
     setBasketStrategy(`Reopen ${b.strategyLabel}`);
     pendingBasketRef.current = { ...b, ts: Date.now() };
     setBasketOpen(true);
-  }, []);
+  }, [setBasketOpen]);
 
   const handleBasketComplete = useCallback(
     (results: Array<{ status: "success" | "error" }>) => {

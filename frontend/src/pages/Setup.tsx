@@ -1,3 +1,4 @@
+import { errorMessage } from "@/lib/apiError";
 import { useState, useEffect } from "react";
 import type { FormEvent } from "react";
 import { useNavigate, Link } from "react-router-dom";
@@ -8,6 +9,7 @@ import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/com
 import { checkSetup, setup } from "@/api/auth";
 
 export default function Setup() {
+  const [setupToken, setSetupToken] = useState("");
   const [username, setUsername] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -33,19 +35,18 @@ export default function Setup() {
       return;
     }
 
-    if (password.length < 6) {
-      setError("Password must be at least 6 characters.");
+    if (password.length < 8) {
+      setError("Password must be at least 8 characters.");
       return;
     }
 
     setSubmitting(true);
 
     try {
-      await setup({ username, email, password });
+      await setup({ username, email, password, setup_token: setupToken });
       navigate("/login");
     } catch (err: unknown) {
-      const axiosErr = err as { response?: { data?: { detail?: string } } };
-      setError(axiosErr.response?.data?.detail ?? "Setup failed. Please try again.");
+      setError(errorMessage(err));
     } finally {
       setSubmitting(false);
     }
@@ -56,7 +57,7 @@ export default function Setup() {
       <Card className="w-full max-w-md">
         <CardHeader className="text-center">
           <CardTitle className="text-2xl">Initial Setup</CardTitle>
-          <CardDescription>Create your admin account</CardDescription>
+          <CardDescription>Create your DHK Paper admin account. All balances and trades are virtual.</CardDescription>
         </CardHeader>
         <CardContent>
           <form onSubmit={handleSubmit} className="space-y-4">
@@ -66,6 +67,10 @@ export default function Setup() {
               </div>
             )}
 
+            <div className="space-y-2">
+              <Label htmlFor="setup-token">Operator setup token</Label>
+              <Input id="setup-token" type="password" value={setupToken} onChange={e => setSetupToken(e.target.value)} required minLength={32} maxLength={256} autoComplete="off" />
+            </div>
             <div className="space-y-2">
               <Label htmlFor="username">Username</Label>
               <Input

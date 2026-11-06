@@ -1,6 +1,6 @@
 # OpenBull Order Constants - matching OpenAlgo standard format
 
-VALID_EXCHANGES = {"NSE", "BSE", "NFO", "BFO", "CDS", "BCD", "MCX", "NCDEX", "NCO", "NSE_INDEX", "BSE_INDEX", "MCX_INDEX", "GLOBAL_INDEX"}
+VALID_EXCHANGES = {"MSE", "GIFT", "GLOBAL", "NSE", "BSE", "NFO", "BFO", "CDS", "BCD", "MCX", "NCDEX", "NCO", "NSE_INDEX", "BSE_INDEX", "MCX_INDEX", "GLOBAL_INDEX"}
 
 VALID_PRODUCT_TYPES = {"CNC", "NRML", "MIS"}
 

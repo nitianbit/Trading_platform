@@ -13,6 +13,9 @@ from __future__ import annotations
 
 from sqlalchemy import (
     Boolean,
+    BigInteger,
+    ForeignKey,
+    CheckConstraint,
     Column,
     DateTime,
     Float,
@@ -24,6 +27,7 @@ from sqlalchemy import (
 )
 
 from backend.database import Base
+from sqlalchemy.orm import relationship, foreign
 
 
 class SandboxOrder(Base):
@@ -64,6 +68,22 @@ class SandboxOrder(Base):
     )
 
 
+class SandboxBrokerage(Base):
+    """Append-only fill charges; retained when paper books are reset."""
+    __tablename__ = "sandbox_brokerage"
+    id = Column(Integer, primary_key=True)
+    tradeid = Column(String(40), unique=True, nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="RESTRICT"), nullable=False, index=True)
+    broker_id = Column(Integer, ForeignKey("users.id", ondelete="RESTRICT"), nullable=False, index=True)
+    admin_id = Column(Integer, ForeignKey("users.id", ondelete="RESTRICT"), nullable=False, index=True)
+    notional_paise = Column(BigInteger, nullable=False)
+    fee_paise = Column(BigInteger, nullable=False)
+    broker_paise = Column(BigInteger, nullable=False)
+    admin_paise = Column(BigInteger, nullable=False)
+    timestamp = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    __table_args__ = (CheckConstraint("fee_paise >= 0 AND broker_paise >= 0 AND admin_paise >= 0 AND fee_paise = broker_paise + admin_paise", name="ck_brokerage_conservation"),)
+
+
 class SandboxTrade(Base):
     """Execution records. Created when a SandboxOrder fills (fully or partially)."""
 
@@ -81,6 +101,9 @@ class SandboxTrade(Base):
     average_price = Column(Float, nullable=False)
     product = Column(String(10), nullable=False)
     strategy = Column(String(100), nullable=True)
+    brokerage = relationship(SandboxBrokerage,
+        primaryjoin=lambda: SandboxTrade.tradeid == foreign(SandboxBrokerage.tradeid),
+        viewonly=True, uselist=False, lazy="joined")
 
     timestamp = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
@@ -169,6 +192,8 @@ class SandboxFund(Base):
     used_margin = Column(Float, nullable=False, default=0.0)
     realized_pnl = Column(Float, nullable=False, default=0.0)
     today_realized_pnl = Column(Float, nullable=False, default=0.0)
+    brokerage_paise = Column(BigInteger, nullable=False, default=0, server_default="0")
+    # Legacy storage compatibility; account P&L derives from open positions.
     unrealized_pnl = Column(Float, nullable=False, default=0.0)
 
     reset_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

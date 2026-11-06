@@ -7,6 +7,7 @@ Response format follows OpenAlgo standard:
 """
 
 import logging
+import asyncio
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
@@ -66,7 +67,7 @@ async def api_place_order(request: Request):
         "strategy": body.get("strategy", ""),
     }
 
-    success, response_data, status_code = place_order(
+    success, response_data, status_code = await asyncio.to_thread(place_order,
         order_data=order_data,
         auth_token=auth_token,
         broker=broker_name,
@@ -103,11 +104,12 @@ async def api_place_smart_order(request: Request):
         "position_size": body.get("position_size", "0"),
     }
 
-    success, response_data, status_code = place_smart_order(
+    success, response_data, status_code = await asyncio.to_thread(place_smart_order,
         order_data=order_data,
         auth_token=auth_token,
         broker=broker_name,
         config=config,
+        user_id=user_id,
     )
 
     return JSONResponse(content=response_data, status_code=status_code)
@@ -124,19 +126,11 @@ async def api_modify_order(request: Request):
     user_id, auth_token, broker_name, config = api_user
 
     body = await _get_request_body(request)
-    # Accept (but ignore for the broker call) the OpenAlgo-style metadata fields
-    # symbol/action/exchange/product/strategy so that requests built for OpenAlgo
-    # work as-is. The broker modify endpoint only needs the fields below.
-    modify_data = {
-        "orderid": body.get("orderid"),
-        "quantity": body.get("quantity"),
-        "price": body.get("price"),
-        "pricetype": body.get("pricetype"),
-        "trigger_price": body.get("trigger_price", "0"),
-        "disclosed_quantity": body.get("disclosed_quantity", "0"),
-    }
+    # Preserve omission so the ledger can merge against the locked order.
+    fields = ("orderid", "quantity", "price", "pricetype", "trigger_price", "disclosed_quantity")
+    modify_data = {field: body[field] for field in fields if field in body}
 
-    success, response_data, status_code = modify_order_service(
+    success, response_data, status_code = await asyncio.to_thread(modify_order_service,
         data=modify_data,
         auth_token=auth_token,
         broker=broker_name,
@@ -168,7 +162,7 @@ async def api_cancel_order(request: Request):
             status_code=400,
         )
 
-    success, response_data, status_code = cancel_order_service(
+    success, response_data, status_code = await asyncio.to_thread(cancel_order_service,
         orderid=orderid,
         auth_token=auth_token,
         broker=broker_name,
@@ -193,7 +187,7 @@ async def api_cancel_all_orders(request: Request):
     body = await _get_request_body(request)
     _strategy = body.get("strategy", "")
 
-    success, response_data, status_code = cancel_all_orders_service(
+    success, response_data, status_code = await asyncio.to_thread(cancel_all_orders_service,
         auth_token=auth_token,
         broker=broker_name,
         config=config,
@@ -218,7 +212,7 @@ async def api_close_all_positions(request: Request):
     # OpenAlgo accepts an optional `strategy` for telemetry — read but unused.
     _strategy = body.get("strategy", "")
 
-    success, response_data, status_code = close_all_positions_service(
+    success, response_data, status_code = await asyncio.to_thread(close_all_positions_service,
         api_key=api_key,
         auth_token=auth_token,
         broker=broker_name,
@@ -238,6 +232,7 @@ def _error_from_exception(exc: Exception) -> JSONResponse:
         return JSONResponse(
             content={"status": "error", "message": message},
             status_code=exc.status_code,
+            headers=exc.headers,
         )
     logger.exception("Unexpected error in API endpoint")
     return JSONResponse(

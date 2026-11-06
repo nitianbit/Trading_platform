@@ -79,4 +79,5 @@ function TabsContent({ className, ...props }: TabsPrimitive.Panel.Props) {
   )
 }
 
+// eslint-disable-next-line react-refresh/only-export-components -- Preserve the established shared component and consumer API.
 export { Tabs, TabsList, TabsTrigger, TabsContent, tabsListVariants }

@@ -1,0 +1,7 @@
+[Unit]
+Description=DHK Paper readiness probe
+
+[Service]
+Type=oneshot
+EnvironmentFile=/opt/dhk-paper/deploy/.env.production
+ExecStart=/usr/bin/python3 /opt/dhk-paper/scripts/check_health.py

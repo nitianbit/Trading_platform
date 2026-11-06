@@ -1,17 +1,15 @@
-"""
-Sandbox order CRUD + fill bookkeeping.
+"""Transactional paper-order ledger.
 
-Light on business logic — it's just a typed layer over the ``sandbox_orders``
-and ``sandbox_trades`` tables. Price conditions, margin checks and fund
-movement live in :mod:`backend.services.sandbox_service` and
-:mod:`backend.sandbox.fund_manager`. The execution engine
-(:mod:`backend.sandbox.execution_engine`) calls :func:`fill` when a pending
-order's trigger condition is met.
+Mutations lock the account and commit order status, trade, position and cash
+together. Validation and margin lookups share that transaction's connection;
+the execution engine supplies a quote and conditions are rechecked here.
 """
 
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
+import math
 import random
 import secrets
 from datetime import datetime
@@ -23,6 +21,7 @@ from sqlalchemy.orm import Session
 from backend.models.sandbox import SandboxOrder, SandboxTrade
 from backend.sandbox._db import session_scope
 from backend.sandbox._session import session_start_ist
+from backend.sandbox import fund_manager
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +42,10 @@ def new_tradeid() -> str:
     return f"TRADE-{now.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(4).upper()}"
 
 
+class OrderValidationError(ValueError):
+    pass
+
+
 def create_order(
     *,
     user_id: int,
@@ -58,9 +61,37 @@ def create_order(
     margin_blocked: float = 0.0,
     initial_status: str = "open",
     rejection_reason: str | None = None,
+    reference_price: float | None = None,
+    db: Session | None = None,
 ) -> SandboxOrder:
     orderid = new_orderid()
-    with session_scope() as db:
+    owns_session = db is None
+    with (session_scope() if owns_session else nullcontext(db)) as db:
+        funds = fund_manager.ensure_fund_row(db, user_id)
+        if initial_status in ("open", "trigger_pending"):
+            from backend.paper.policy import order_access
+            allowed, reason = order_access(db=db, user_id=user_id, symbol=symbol, exchange=exchange,
+                product=product, action=action.upper(), quantity=quantity)
+            if not allowed:
+                initial_status, rejection_reason = "rejected", reason
+                margin_blocked = 0.0
+        if initial_status in ("open", "trigger_pending"):
+            margin_blocked = fund_manager.required_order_margin(db, user_id, symbol, exchange,
+                product, action, quantity, reference_price if reference_price is not None else price)
+            from backend.sandbox.brokerage import quote_charge
+            try:
+                quote = quote_charge(db, user_id, reference_price if reference_price is not None else price, quantity)
+            except ValueError as error:
+                initial_status, rejection_reason, margin_blocked = "rejected", str(error), 0.0
+                quote = None
+            fee = quote.fee_paise / 100 if quote else 0.0
+            if initial_status != "rejected" and margin_blocked > 0 and margin_blocked + fee > funds.available:
+                initial_status = "rejected"
+                rejection_reason = f"Insufficient virtual funds: margin ₹{margin_blocked:.2f} plus 4% brokerage ₹{fee:.2f}; available ₹{funds.available:.2f}"
+                margin_blocked = 0.0
+            elif initial_status != "rejected":
+                funds.available = round(funds.available - margin_blocked, 2)
+                funds.used_margin = round(funds.used_margin + margin_blocked, 2)
         row = SandboxOrder(
             user_id=user_id,
             orderid=orderid,
@@ -79,9 +110,8 @@ def create_order(
         )
         db.add(row)
         db.flush()
-        # Force a read after flush so the caller gets the server-assigned id.
-        db.refresh(row)
-        db.expunge(row)
+        if owns_session:
+            db.expunge(row)
     return row
 
 
@@ -162,51 +192,67 @@ def count_all_orders() -> int:
         ).scalar() or 0
 
 
-def modify_order(
-    user_id: int,
-    orderid: str,
-    *,
-    quantity: int | None = None,
-    price: float | None = None,
-    trigger_price: float | None = None,
-    pricetype: str | None = None,
-) -> SandboxOrder | None:
+def modify_order(user_id: int, orderid: str, *, quantity: int | None = None,
+                 price: float | None = None, trigger_price: float | None = None,
+                 pricetype: str | None = None) -> SandboxOrder | None:
+    from backend.sandbox.order_validation import validate_order
+    from backend.sandbox.quote_helper import get_ltp
     with session_scope() as db:
-        row = db.execute(
-            select(SandboxOrder).where(
-                SandboxOrder.user_id == user_id, SandboxOrder.orderid == orderid
-            )
-        ).scalar_one_or_none()
+        funds = fund_manager.ensure_fund_row(db, user_id)
+        row = db.scalar(select(SandboxOrder).where(SandboxOrder.user_id == user_id,
+            SandboxOrder.orderid == orderid).with_for_update())
         if row is None or row.status not in ("open", "trigger_pending"):
             return None
-        if quantity is not None:
-            row.quantity = int(quantity)
-        if price is not None:
-            row.price = float(price)
-        if trigger_price is not None:
-            row.trigger_price = float(trigger_price)
-        if pricetype is not None:
-            row.pricetype = pricetype.upper()
+        values = dict(user_id=user_id, symbol=row.symbol, exchange=row.exchange,
+            product=row.product, action=row.action,
+            quantity=row.quantity if quantity is None else quantity,
+            price=row.price if price is None else price,
+            trigger_price=row.trigger_price if trigger_price is None else trigger_price,
+            pricetype=row.pricetype if pricetype is None else pricetype.upper())
+        ok, reason, _ = validate_order(**values, db=db, remaining_quantity=values["quantity"] - row.filled_quantity)
+        if not ok:
+            raise OrderValidationError(reason)
+        if values["quantity"] <= row.filled_quantity:
+            raise OrderValidationError("quantity must exceed the already filled quantity")
+        reference = values["price"] if values["pricetype"] in ("LIMIT", "SL") else get_ltp(user_id, row.symbol, row.exchange)
+        if reference is None or not math.isfinite(reference) or reference <= 0:
+            raise OrderValidationError("No fresh price available")
+        margin = fund_manager.required_order_margin(db, user_id, row.symbol, row.exchange,
+            row.product, row.action, values["quantity"] - row.filled_quantity, reference)
+        difference = round(margin - row.margin_blocked, 2)
+        from backend.sandbox.brokerage import quote_charge
+        try:
+            charge = quote_charge(db, user_id, reference, values["quantity"] - row.filled_quantity)
+        except ValueError as error:
+            raise OrderValidationError(str(error)) from None
+        fee = charge.fee_paise / 100 if charge else 0.0
+        if margin > 0 and difference + fee > funds.available:
+            raise OrderValidationError("Insufficient sandbox funds for margin and brokerage")
+        funds.available = round(funds.available - difference, 2)
+        funds.used_margin = round(funds.used_margin + difference, 2)
+        for field in ("quantity", "price", "trigger_price", "pricetype"):
+            setattr(row, field, values[field])
+        row.margin_blocked = margin
+        row.status = "trigger_pending" if row.pricetype in ("SL", "SL-M") else "open"
         db.flush()
-        db.refresh(row)
         db.expunge(row)
         return row
 
 
-def cancel_order(user_id: int, orderid: str) -> SandboxOrder | None:
-    """Mark the order cancelled. Returns the row (with margin_blocked) so the
-    caller can release funds. Returns ``None`` if the order isn't cancellable."""
+def cancel_order(user_id: int, orderid: str, *, reason: str | None = None) -> SandboxOrder | None:
     with session_scope() as db:
-        row = db.execute(
-            select(SandboxOrder).where(
-                SandboxOrder.user_id == user_id, SandboxOrder.orderid == orderid
-            )
-        ).scalar_one_or_none()
+        funds = fund_manager.ensure_fund_row(db, user_id)
+        row = db.scalar(select(SandboxOrder).where(SandboxOrder.user_id == user_id,
+            SandboxOrder.orderid == orderid).with_for_update())
         if row is None or row.status not in ("open", "trigger_pending"):
             return None
+        released = min(row.margin_blocked, funds.used_margin)
+        funds.used_margin = round(funds.used_margin - released, 2)
+        funds.available = round(funds.available + released, 2)
+        row.margin_blocked = 0.0
         row.status = "cancelled"
+        row.rejection_reason = reason
         db.flush()
-        db.refresh(row)
         db.expunge(row)
         return row
 
@@ -228,75 +274,89 @@ def list_cancellable_orders(user_id: int) -> list[SandboxOrder]:
         return list(rows)
 
 
-def fill(
-    user_id: int,
-    orderid: str,
-    fill_price: float,
-    fill_quantity: int | None = None,
-) -> tuple[SandboxOrder | None, SandboxTrade | None]:
-    """Mark an order complete at ``fill_price``. Creates a SandboxTrade.
-
-    Partial fills are supported by passing ``fill_quantity`` < remaining; the
-    order stays ``open`` with ``filled_quantity`` updated. For phase 2a the
-    engine always fills fully at LTP.
-    """
-    with session_scope() as db:
-        row = db.execute(
-            select(SandboxOrder).where(
-                SandboxOrder.user_id == user_id, SandboxOrder.orderid == orderid
-            )
-        ).scalar_one_or_none()
+def fill(user_id: int, orderid: str, fill_price: float,
+         fill_quantity: int | None = None, *, ltp: float | None = None, db: Session | None = None
+         ) -> tuple[SandboxOrder | None, SandboxTrade | None]:
+    """Claim the order and commit its trade, position and cash in one transaction."""
+    from backend.sandbox.order_validation import validate_order
+    from backend.sandbox.position_manager import apply_fill
+    owns_session = db is None
+    with (session_scope() if owns_session else nullcontext(db)) as db:
+        funds = fund_manager.ensure_fund_row(db, user_id)
+        row = db.scalar(select(SandboxOrder).where(SandboxOrder.user_id == user_id,
+            SandboxOrder.orderid == orderid).with_for_update())
         if row is None or row.status not in ("open", "trigger_pending"):
             return None, None
-
-        qty = fill_quantity if fill_quantity is not None else (row.quantity - row.filled_quantity)
-        if qty <= 0:
+        if ltp is not None:
+            price = fill_price_for(row, ltp)
+            if price is None:
+                return None, None
+            fill_price = price
+        remaining = row.quantity - row.filled_quantity
+        qty = remaining if fill_quantity is None else fill_quantity
+        ok, reason, _ = validate_order(user_id=user_id, symbol=row.symbol,
+            exchange=row.exchange, action=row.action, quantity=qty, product=row.product,
+            pricetype=row.pricetype, price=row.price, trigger_price=row.trigger_price, db=db)
+        if not ok or qty > remaining or not math.isfinite(fill_price) or fill_price <= 0:
+            _reject_locked(row, funds, reason or "Invalid fill")
             return None, None
-
-        # Running-average fill price (we don't currently do partial fills but
-        # keeping the math correct for future).
-        prev_qty = row.filled_quantity
-        prev_avg = row.average_price
-        new_total_qty = prev_qty + qty
-        new_avg = (
-            (prev_avg * prev_qty + fill_price * qty) / new_total_qty
-            if new_total_qty > 0
-            else fill_price
-        )
-
-        row.filled_quantity = new_total_qty
-        row.average_price = round(new_avg, 4)
-        if row.filled_quantity >= row.quantity:
-            row.status = "complete"
-
-        trade = SandboxTrade(
-            user_id=user_id,
-            orderid=orderid,
-            tradeid=new_tradeid(),
-            symbol=row.symbol,
-            exchange=row.exchange,
-            action=row.action,
-            quantity=int(qty),
-            average_price=round(fill_price, 4),
-            product=row.product,
-            strategy=row.strategy,
-        )
+        fill_price = round(fill_price, 4)
+        from backend.sandbox.brokerage import quote_charge, record_charge
+        try:
+            charge = quote_charge(db, user_id, fill_price, qty)
+        except ValueError as error:
+            _reject_locked(row, funds, str(error))
+            return None, None
+        fee = charge.fee_paise / 100 if charge else 0.0
+        required = fund_manager.required_order_margin(db, user_id, row.symbol,
+            row.exchange, row.product, row.action, qty, fill_price)
+        reserved = row.margin_blocked if qty == remaining else round(row.margin_blocked * qty / remaining, 2)
+        with db.begin_nested() as position_change:
+            realized, released = apply_fill(user_id, row.symbol, row.exchange, row.product,
+                row.action, qty, fill_price, required, db=db)
+            cash = round(funds.available + reserved + released + realized - required - fee, 2)
+            if required > 0 and cash < 0:
+                position_change.rollback()
+                _reject_locked(row, funds, "Insufficient sandbox funds for margin and brokerage at fill")
+                return None, None
+        funds.available = cash
+        funds.used_margin = round(funds.used_margin + required - reserved - released, 2)
+        funds.realized_pnl = round(funds.realized_pnl + realized - fee, 4)
+        funds.today_realized_pnl = round(funds.today_realized_pnl + realized - fee, 4)
+        funds.brokerage_paise += charge.fee_paise if charge else 0
+        total = row.filled_quantity + qty
+        row.average_price = round((row.average_price * row.filled_quantity + fill_price * qty) / total, 4)
+        row.filled_quantity = total
+        row.margin_blocked = round(row.margin_blocked - reserved, 2)
+        row.status = "complete" if total == row.quantity else "open"
+        trade = SandboxTrade(user_id=user_id, orderid=orderid, tradeid=new_tradeid(),
+            symbol=row.symbol, exchange=row.exchange, action=row.action, quantity=qty,
+            average_price=round(fill_price, 4), product=row.product, strategy=row.strategy)
         db.add(trade)
+        trade.brokerage = record_charge(db, user_id, trade.tradeid, charge)
         db.flush()
-        db.refresh(row)
-        db.refresh(trade)
-        db.expunge(row)
-        db.expunge(trade)
+        if owns_session:
+            db.expunge(row)
+            db.expunge(trade)
         return row, trade
+
+
+def _reject_locked(row: SandboxOrder, funds, reason: str) -> None:
+    released = min(row.margin_blocked, funds.used_margin)
+    funds.used_margin = round(funds.used_margin - released, 2)
+    funds.available = round(funds.available + released, 2)
+    row.margin_blocked = 0.0
+    row.status = "rejected"
+    row.rejection_reason = reason[:500]
 
 
 def reject_order(user_id: int, orderid: str, reason: str) -> None:
     with session_scope() as db:
-        db.execute(
-            update(SandboxOrder)
-            .where(SandboxOrder.user_id == user_id, SandboxOrder.orderid == orderid)
-            .values(status="rejected", rejection_reason=reason[:500])
-        )
+        funds = fund_manager.ensure_fund_row(db, user_id)
+        row = db.scalar(select(SandboxOrder).where(SandboxOrder.user_id == user_id,
+            SandboxOrder.orderid == orderid).with_for_update())
+        if row is not None and row.status in ("open", "trigger_pending"):
+            _reject_locked(row, funds, reason)
 
 
 def to_dict(order: SandboxOrder) -> dict[str, Any]:
@@ -324,9 +384,9 @@ def to_dict(order: SandboxOrder) -> dict[str, Any]:
         "pending_quantity": max(0, order.quantity - order.filled_quantity),
         "pricetype": order.pricetype,
         "product": order.product,
-        "price": round(order.price, 2),
-        "trigger_price": round(order.trigger_price, 2),
-        "average_price": round(order.average_price, 2),
+        "price": round(order.price, 4),
+        "trigger_price": round(order.trigger_price, 4),
+        "average_price": round(order.average_price, 4),
         "timestamp": ts,
         "order_timestamp": ts,
         "strategy": order.strategy or "",
@@ -342,6 +402,7 @@ def trade_to_dict(trade: SandboxTrade) -> dict[str, Any]:
     Missing this contract — specifically the ``trade_value`` field — used to
     crash the TradeBook page with a ``toFixed`` of ``undefined`` error.
     """
+    from backend.sandbox.brokerage import fee_fields
     qty = trade.quantity or 0
     avg = trade.average_price or 0.0
     ts = (
@@ -350,6 +411,7 @@ def trade_to_dict(trade: SandboxTrade) -> dict[str, Any]:
         else ""
     )
     return {
+        **fee_fields(trade.brokerage),
         "tradeid": trade.tradeid,
         "orderid": trade.orderid,
         "symbol": trade.symbol,
@@ -357,9 +419,58 @@ def trade_to_dict(trade: SandboxTrade) -> dict[str, Any]:
         "action": trade.action,
         "product": trade.product,
         "quantity": int(qty),
-        "average_price": round(float(avg), 2),
-        "trade_value": round(float(qty) * float(avg), 2),
+        "average_price": round(float(avg), 4),
+        "trade_value": trade.brokerage.notional_paise / 100 if trade.brokerage else round(float(qty) * float(avg), 2),
         "strategy": trade.strategy or "",
         "timestamp": ts,
         "trade_timestamp": ts,
     }
+
+
+def fill_price_for(order, ltp: float) -> float | None:
+    """Return the price this order should fill at given the current LTP,
+    or ``None`` if the trigger condition is not met.
+
+    Conventions (matching openalgo's sandbox):
+      * MARKET  → fill at LTP immediately
+      * LIMIT BUY  → fill when LTP <= limit price, execute at limit price
+      * LIMIT SELL → fill when LTP >= limit price, execute at limit price
+      * SL BUY   → trigger when LTP >= trigger_price, then behaves like a LIMIT BUY
+      * SL SELL  → trigger when LTP <= trigger_price, then behaves like a LIMIT SELL
+      * SL-M     → trigger + fill at LTP
+    """
+    if ltp <= 0:
+        return None
+
+    pt = order.pricetype.upper()
+    action = order.action.upper()
+
+    if pt == "MARKET":
+        return ltp
+
+    if pt == "LIMIT":
+        if action == "BUY" and ltp <= order.price:
+            return order.price
+        if action == "SELL" and ltp >= order.price:
+            return order.price
+        return None
+
+    if pt in ("SL", "SL-M"):
+        # SL orders are trigger_pending until LTP crosses trigger.
+        trigger = order.trigger_price
+        triggered = (
+            (action == "BUY" and ltp >= trigger) or
+            (action == "SELL" and ltp <= trigger)
+        )
+        if not triggered:
+            return None
+        # Once triggered, SL fills at LIMIT price (if set), SL-M at LTP.
+        if pt == "SL":
+            if action == "BUY" and ltp <= order.price:
+                return order.price
+            if action == "SELL" and ltp >= order.price:
+                return order.price
+            return None
+        return ltp  # SL-M
+
+    return None

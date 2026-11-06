@@ -16,9 +16,11 @@ if the symbol isn't here, the order is rejected (same as openalgo).
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from backend.models.symbol import SymToken
 from backend.sandbox._db import session_scope
@@ -28,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 # F&O exchanges. ``CRYPTO`` not currently in openbull's symbol master, but
 # kept in the set so the validation gate matches openalgo's exchange list.
-FNO_EXCHANGES = {"NFO", "BFO", "MCX", "CDS", "BCD", "CRYPTO"}
+FNO_EXCHANGES = {"MSE", "GIFT", "GLOBAL", "NFO", "BFO", "MCX", "CDS", "BCD", "CRYPTO"}
 EQUITY_EXCHANGES = {"NSE", "BSE"}
 
 # Product compatibility per exchange. CNC is delivery (equity only), NRML is
@@ -47,7 +49,8 @@ class SymbolInfo:
     exchange: str
     lot_size: int
     tick_size: float
-    instrument_type: str  # "EQ", "FUT", "CE", "PE", or "" if unknown
+    expiry: str | None = None
+    instrument_type: str = ""  # "EQ", "FUT", "CE", "PE", or "" if unknown
 
     @property
     def is_option(self) -> bool:
@@ -62,14 +65,14 @@ class SymbolInfo:
         return self.exchange in EQUITY_EXCHANGES and not self.is_option and not self.is_future
 
 
-def get_symbol_info(symbol: str, exchange: str) -> SymbolInfo | None:
+def get_symbol_info(symbol: str, exchange: str, *, db: Session | None = None) -> SymbolInfo | None:
     """Look up the symbol master. Returns ``None`` if the symbol isn't there.
 
     The caller (order placement) treats ``None`` as a hard rejection — same as
     openalgo, which refuses to accept orders for unknown symbols."""
     if not symbol or not exchange:
         return None
-    with session_scope() as db:
+    with (nullcontext(db) if db is not None else session_scope()) as db:
         row = db.execute(
             select(SymToken).where(
                 SymToken.symbol == symbol,
@@ -84,6 +87,7 @@ def get_symbol_info(symbol: str, exchange: str) -> SymbolInfo | None:
             lot_size=int(row.lotsize or 1),
             tick_size=float(row.tick_size or 0.05),
             instrument_type=(row.instrumenttype or "").upper(),
+            expiry=row.expiry,
         )
 
 

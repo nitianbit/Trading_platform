@@ -1,3 +1,4 @@
+import { useNow } from "@/hooks/useNow";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getMultiQuotes, type MultiQuoteRow } from "@/api/quotes";
 import { useMarketData } from "@/hooks/useMarketData";
@@ -80,6 +81,7 @@ export function useLivePrice<T extends PriceableItem>(
   const { isVisible, wasHidden } = usePageVisibility();
   const { isAnyMarketOpen } = useMarketStatus();
   const isPaused = pauseWhenHidden && !isVisible;
+  const now = useNow(enabled && items.length > 0 && !isPaused);
 
   const symbols = useMemo(
     () => items.map((i) => ({ symbol: i.symbol, exchange: i.exchange })),
@@ -151,6 +153,7 @@ export function useLivePrice<T extends PriceableItem>(
   const wasHiddenRef = useRef(wasHidden);
   useEffect(() => {
     if (wasHidden && !wasHiddenRef.current && isVisible) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- Refresh network-backed state when the tab becomes visible.
       void fetchMultiQuotes();
     }
     wasHiddenRef.current = wasHidden;
@@ -168,7 +171,7 @@ export function useLivePrice<T extends PriceableItem>(
       const wsFresh =
         wsData?.data?.ltp != null &&
         wsData.lastUpdate != null &&
-        Date.now() - wsData.lastUpdate < staleThreshold;
+        now - wsData.lastUpdate < staleThreshold;
 
       // Priority: fresh WS tick -> MultiQuotes -> REST baseline.
       let currentLtp = item.ltp;
@@ -201,7 +204,7 @@ export function useLivePrice<T extends PriceableItem>(
 
       return { ...item, ltp: currentLtp, pnl, pnlpercent } as T;
     });
-  }, [items, marketData, multiQuotes, staleThreshold]);
+  }, [items, marketData, multiQuotes, staleThreshold, now]);
 
   return {
     data: enhancedData,

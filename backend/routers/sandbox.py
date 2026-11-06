@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 
 from backend.dependencies import get_current_user
 from backend.models.user import User
+from backend.routers.paper import require_admin
 from backend.sandbox import config as sbx_config
 from backend.sandbox import (
     fund_manager,
@@ -45,13 +46,13 @@ class ConfigUpdate(BaseModel):
 
 
 @router.get("/config")
-async def list_configs(user: User = Depends(get_current_user)):
+def list_configs(user: User = Depends(get_current_user)):
     """Return every sandbox_config row so the UI can render a settings form."""
     return {"status": "success", "data": sbx_config.get_all_configs()}
 
 
 @router.post("/config")
-async def update_config(
+def update_config(
     payload: ConfigUpdate,
     user: User = Depends(get_current_user),
 ):
@@ -67,23 +68,14 @@ async def update_config(
 
 
 @router.post("/reset")
-async def reset_my_sandbox(user: User = Depends(get_current_user)):
-    """Wipe the caller's sandbox orders / trades / positions / holdings and
-    reset funds to the current ``starting_capital``. Per-user — doesn't touch
-    other users' sandbox state.
-    """
-    with session_scope() as db:
-        db.execute(delete(SandboxOrder).where(SandboxOrder.user_id == user.id))
-        db.execute(delete(SandboxTrade).where(SandboxTrade.user_id == user.id))
-        db.execute(delete(SandboxPosition).where(SandboxPosition.user_id == user.id))
-        db.execute(delete(SandboxHolding).where(SandboxHolding.user_id == user.id))
-    fund_manager.reset_funds(user.id)
-    logger.info("Sandbox reset by user %s (id=%d)", user.username, user.id)
+def reset_my_sandbox(user: User = Depends(require_admin)):
+    weekly_reset.reset_user(user.id)
+    logger.info("Sandbox reset by admin %s (id=%d)", user.username, user.id)
     return {"status": "success"}
 
 
 @router.get("/summary")
-async def summary(user: User = Depends(get_current_user)):
+def summary(user: User = Depends(require_admin)):
     """Tiny aggregate for the /sandbox page — orders count, funds snapshot."""
     total_orders = order_manager.count_all_orders()
     funds = fund_manager.get_funds_snapshot(user.id)
@@ -94,7 +86,7 @@ async def summary(user: User = Depends(get_current_user)):
 
 
 @router.get("/mypnl")
-async def my_daily_pnl(
+def my_daily_pnl(
     limit: int = 180,
     user: User = Depends(get_current_user),
 ):
@@ -130,7 +122,7 @@ async def my_daily_pnl(
 
 
 @router.post("/squareoff-now")
-async def squareoff_now(
+def squareoff_now(
     bucket: str = "nse_nfo_bse_bfo",
     user: User = Depends(get_current_user),
 ):
@@ -146,7 +138,7 @@ async def squareoff_now(
 
 
 @router.post("/settle-now")
-async def settle_now(user: User = Depends(get_current_user)):
+def settle_now(user: User = Depends(get_current_user)):
     """Manual trigger for T+1 CNC settlement + daily P&L snapshot. Admin-only."""
     if not user.is_admin:
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -160,7 +152,7 @@ async def settle_now(user: User = Depends(get_current_user)):
 
 
 @router.post("/wipe-all")
-async def wipe_all(user: User = Depends(get_current_user)):
+def wipe_all(user: User = Depends(get_current_user)):
     """Manual trigger for the weekly reset job. Wipes every user's state.
     Admin-only and intentionally destructive."""
     if not user.is_admin:
@@ -175,7 +167,7 @@ async def wipe_all(user: User = Depends(get_current_user)):
 # ---------------------------------------------------------------------------
 
 @router.get("/squareoff-status")
-async def squareoff_status(user: User = Depends(get_current_user)):
+def squareoff_status(user: User = Depends(get_current_user)):
     """Return each squareoff bucket's configured cut-off time and whether the
     job has already run today. Lets the UI render a "next run at HH:MM" badge
     without restarting the scheduler."""
@@ -217,7 +209,7 @@ async def squareoff_status(user: User = Depends(get_current_user)):
 
 
 @router.post("/reload-squareoff")
-async def reload_squareoff(user: User = Depends(get_current_user)):
+def reload_squareoff(user: User = Depends(get_current_user)):
     """Acknowledge that the scheduler should pick up new squareoff times on
     its next tick. The scheduler reads config every loop iteration so this
     is a no-op confirmation; admin-gated to match openalgo's surface."""
@@ -235,9 +227,9 @@ async def reload_squareoff(user: User = Depends(get_current_user)):
 # ---------------------------------------------------------------------------
 
 @router.post("/reconcile-margin")
-async def reconcile_margin_endpoint(
+def reconcile_margin_endpoint(
     auto_fix: bool = True,
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_admin),
 ):
     """Compare ``fund.used_margin`` against the sum of position margins for
     the calling user. Releases stuck margin to *available* if ``auto_fix``

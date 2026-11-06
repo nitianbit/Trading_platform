@@ -82,6 +82,7 @@ export function ExpiryPicker({
 }
 
 /** "02-MAY-2026" → "02MAY26" — same converter the existing tools use. */
+// eslint-disable-next-line react-refresh/only-export-components -- Preserve the established shared component and consumer API.
 export function convertExpiryForApi(expiry: string): string {
   if (!expiry) return "";
   // "02-MAY-2026" -> ["02","MAY","2026"]

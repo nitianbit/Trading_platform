@@ -1,0 +1,28 @@
+{$APP_DOMAIN} {
+    encode zstd gzip
+    request_body {
+        max_size 64KB
+    }
+    handle /stream {
+        reverse_proxy backend:8783
+    }
+    @backend path /auth/* /web/* /api/* /health /broker/* /docs /redoc /openapi.json
+    handle @backend {
+        reverse_proxy backend:8083 {
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto https
+        }
+    }
+    handle {
+        root * /srv
+        try_files {path} /index.html
+        file_server
+    }
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        Referrer-Policy strict-origin-when-cross-origin
+        Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' wss://{$APP_DOMAIN}; frame-ancestors 'none'"
+    }
+}

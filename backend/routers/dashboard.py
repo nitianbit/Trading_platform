@@ -15,7 +15,7 @@ router = APIRouter(prefix="/web", tags=["dashboard"])
 
 
 @router.get("/dashboard")
-async def dashboard(ctx: BrokerContext = Depends(get_broker_context)):
+def dashboard(ctx: BrokerContext = Depends(get_broker_context)):
     """Get dashboard data including funds/margin information."""
     success, response_data, status_code = get_funds_with_auth(
         auth_token=ctx.auth_token,

@@ -1,35 +1,17 @@
-"""
-Sandbox position book.
+"""Position accounting shared by transactional fills and startup settlement.
 
-Positions are updated atomically on every fill (:func:`apply_fill`). We track
-realized and unrealized PnL separately so the dashboard can show both; the
-*running average* cost is used for BUY accumulation and FIFO-style offset on
-SELL (same as most brokers report).
-
-Margin lifecycle (matches openalgo's sandbox):
-
-* New position / accumulation: the order's blocked margin transfers from
-  ``SandboxOrder.margin_blocked`` into ``SandboxPosition.margin_blocked``.
-  No fund movement — the cash is already locked, only its bookkeeping bucket
-  changes.
-* Reduce: ``offset_qty / abs(old_qty)`` of the position's margin is released
-  back to *available* together with the realized PnL on the offset, in a
-  single :func:`fund_manager.release_margin` call (atomic transaction).
-* Full close: the entire position margin is released along with realized PnL.
-* Reverse with leftover: offset portion releases pro-rata, the residual
-  position picks up whatever margin the order was carrying for the excess
-  (see ``place_order`` for the position-aware sizing).
-
-The per-user lock is held by the caller (the execution engine) for the
-duration of fill processing — see :mod:`backend.sandbox.execution_engine`.
+The order ledger supplies margin for fresh exposure at fill time and owns
+cash movement. Mark-to-market uses the same account lock as fills.
 """
 
 from __future__ import annotations
 
 import logging
+from decimal import Decimal, ROUND_HALF_UP
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select, text
+from sqlalchemy import select, text, func
 from sqlalchemy.orm import Session
 
 from backend.models.sandbox import SandboxPosition, SandboxTrade
@@ -97,6 +79,7 @@ def apply_fill(
     quantity: int,
     price: float,
     order_margin: float = 0.0,
+    *, db: Session | None = None,
 ) -> tuple[float, float]:
     """Update the position for a single fill.
 
@@ -118,7 +101,7 @@ def apply_fill(
     realized_delta = 0.0
     margin_to_release = 0.0
 
-    with session_scope() as db:
+    with (nullcontext(db) if db is not None else session_scope()) as db:
         pos = _get_or_create(db, user_id, symbol, exchange, product)
         old_net = pos.net_quantity
         old_avg = pos.average_price
@@ -132,7 +115,8 @@ def apply_fill(
             new_total_cost = old_avg * abs(old_net) + price * abs(signed_qty)
             new_avg = new_total_cost / abs(new_net) if new_net != 0 else 0.0
             pos.net_quantity = new_net
-            pos.average_price = round(new_avg, 4)
+            # Preserve weighted cost internally; four decimals are an output format.
+            pos.average_price = new_avg
             # Transfer the order's blocked margin onto the position. No fund
             # movement — `used_margin` already reflects this amount; only its
             # bookkeeping bucket (order → position) changes.
@@ -143,12 +127,16 @@ def apply_fill(
         # ---------------------------------------------------------------
         else:
             offset_qty = min(abs(old_net), abs(signed_qty))
-            if old_net > 0:
-                # was long, now selling → gain = (sell_price - old_avg) * qty
-                realized_delta = (price - old_avg) * offset_qty
-            else:
-                # was short, now buying → gain = (old_avg - buy_price) * qty
-                realized_delta = (old_avg - price) * offset_qty
+            previous_realized = Decimal(str(pos.realized_pnl or 0.0))
+            gross = (Decimal(str(price)) - Decimal(str(old_avg))) * offset_qty
+            if old_net < 0:
+                gross = -gross
+            cumulative_realized = previous_realized + gross
+            # Post the change in rounded cumulative money, carrying sub-paise
+            # residuals in the position rather than creating cash on each close.
+            paise = Decimal("0.01")
+            realized_delta = float(cumulative_realized.quantize(paise, rounding=ROUND_HALF_UP)
+                - previous_realized.quantize(paise, rounding=ROUND_HALF_UP))
 
             remaining = abs(signed_qty) - offset_qty
             new_net = old_net + signed_qty
@@ -183,7 +171,7 @@ def apply_fill(
                 pos.margin_blocked = round(max(0.0, old_margin - margin_to_release), 2)
                 # average_price unchanged
 
-            pos.realized_pnl = round(pos.realized_pnl + realized_delta, 4)
+            pos.realized_pnl = float(cumulative_realized)
             pos.today_realized_pnl = round(
                 float(pos.today_realized_pnl or 0.0) + realized_delta, 4
             )
@@ -198,8 +186,9 @@ def apply_fill(
             pos.day_sell_quantity += quantity
             pos.day_sell_value = round(pos.day_sell_value + price * quantity, 2)
 
-        # LTP/PnL refresh will happen in mark_to_market; keep pos.pnl
-        # consistent for now so the orderbook UI shows something sensible.
+        # Each fill changes quantity/cost; refresh the position-owned values now.
+        pos.ltp = round(price, 4)
+        pos.unrealized_pnl = round((price - pos.average_price) * pos.net_quantity, 4)
         pos.pnl = round(pos.realized_pnl + pos.unrealized_pnl, 4)
 
     return round(realized_delta, 4), round(margin_to_release, 2)
@@ -212,6 +201,8 @@ def mark_to_market(
     if ltp <= 0:
         return
     with session_scope() as db:
+        from backend.sandbox.fund_manager import ensure_fund_row
+        ensure_fund_row(db, user_id)
         pos = db.execute(
             select(SandboxPosition).where(
                 SandboxPosition.user_id == user_id,
@@ -234,7 +225,7 @@ def mark_to_market(
 def get_positions(user_id: int) -> list[dict]:
     """Broker-compatible position payload — shape matches the transform layer.
 
-    Auto-settles expired F&O contracts before returning, then applies a
+    Applies a
     session-aware filter so closed positions from previous sessions don't
     linger on the page (mirrors openalgo's ``get_open_positions``):
 
@@ -257,12 +248,6 @@ def get_positions(user_id: int) -> list[dict]:
     that didn't trade this session has the bucket zeroed via raw SQL (so
     ``updated_at`` stays put for diagnostics).
     """
-    try:
-        from backend.sandbox.catch_up import _close_expired_fno_positions
-        _close_expired_fno_positions()
-    except Exception:
-        logger.exception("get_positions: expired-FnO sweep raised; continuing")
-
     boundary = _last_session_boundary()
 
     with session_scope() as db:
@@ -343,12 +328,12 @@ def get_positions(user_id: int) -> list[dict]:
                 # field still carries the historical number for callers
                 # that care.
                 "average_price": (
-                    round(r.average_price, 2) if r.net_quantity != 0 else 0.0
+                    round(r.average_price, 4) if r.net_quantity != 0 else 0.0
                 ),
                 "averageprice": (
-                    round(r.average_price, 2) if r.net_quantity != 0 else 0.0
+                    round(r.average_price, 4) if r.net_quantity != 0 else 0.0
                 ),
-                "ltp": round(r.ltp, 2),
+                "ltp": round(r.ltp, 4),
                 "pnl": round(
                     r.pnl if r.net_quantity != 0
                     else float(r.today_realized_pnl or 0.0),
@@ -361,3 +346,11 @@ def get_positions(user_id: int) -> list[dict]:
             }
             for r in visible
         ]
+
+
+def get_unrealized_total(db: Session, user_id: int) -> float:
+    """Derive the account total from its open positions, including the empty book."""
+    value = db.scalar(select(func.coalesce(func.sum(SandboxPosition.unrealized_pnl), 0)).where(
+        SandboxPosition.user_id == user_id, SandboxPosition.net_quantity != 0,
+    ))
+    return round(float(value), 2)

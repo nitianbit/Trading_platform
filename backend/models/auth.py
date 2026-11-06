@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, Boolean, DateTime, ForeignKey, UniqueConstraint, func
+from sqlalchemy import Column, Integer, String, Text, Boolean, DateTime, ForeignKey, UniqueConstraint, Index, func
 
 from backend.database import Base
 
@@ -23,9 +23,10 @@ class BrokerAuth(Base):
 
 class ApiKey(Base):
     __tablename__ = "api_keys"
+    __table_args__ = (Index("idx_api_keys_hash", "api_key_hash", unique=True),)
 
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), unique=True, nullable=False)
-    api_key_hash = Column(Text, nullable=False)  # Argon2
+    api_key_hash = Column(Text, nullable=False)  # HMAC-SHA256
     api_key_encrypted = Column(Text, nullable=False)  # Fernet
     created_at = Column(DateTime(timezone=True), server_default=func.now())

@@ -15,7 +15,7 @@ router = APIRouter(prefix="/web", tags=["holdings"])
 
 
 @router.get("/holdings")
-async def holdings(ctx: BrokerContext = Depends(get_broker_context)):
+def holdings(ctx: BrokerContext = Depends(get_broker_context)):
     """Get holdings/portfolio data from the broker."""
     success, response_data, status_code = get_holdings_with_auth(
         auth_token=ctx.auth_token,

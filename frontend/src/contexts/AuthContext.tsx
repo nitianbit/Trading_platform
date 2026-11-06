@@ -1,7 +1,9 @@
+import { signOut } from "@/lib/signOut";
 import { createContext, useContext, useCallback } from "react";
 import type { ReactNode } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { getMe, login as loginApi, logout as logoutApi } from "@/api/auth";
+import { getMe, login as loginApi } from "@/api/auth";
+import { authKey, replaceSession } from "@/lib/authSession";
 import type { UserInfo, LoginRequest } from "@/types/auth";
 
 interface AuthContextType {
@@ -18,7 +20,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const queryClient = useQueryClient();
 
   const { data: user, isLoading: loading } = useQuery({
-    queryKey: ["auth", "me"],
+    queryKey: authKey,
     queryFn: getMe,
     retry: false,
     staleTime: 5 * 60 * 1000,
@@ -28,16 +30,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     async (data: LoginRequest): Promise<UserInfo> => {
       await loginApi(data);
       const userInfo = await getMe();
-      queryClient.setQueryData(["auth", "me"], userInfo);
+      await replaceSession(queryClient, userInfo);
       return userInfo;
     },
     [queryClient]
   );
 
   const logout = useCallback(async () => {
-    await logoutApi();
-    queryClient.setQueryData(["auth", "me"], null);
-    queryClient.clear();
+    await signOut(queryClient);
   }, [queryClient]);
 
   const refreshUser = useCallback(async () => {
@@ -53,6 +53,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   );
 }
 
+// eslint-disable-next-line react-refresh/only-export-components -- Keep the existing context and consumer hook API together.
 export function useAuth(): AuthContextType {
   const context = useContext(AuthContext);
   if (!context) {

@@ -227,7 +227,8 @@ export default function Logs() {
   const nextCursor = logsQuery.data?.next_cursor ?? null;
 
   const exportUrl = useMemo(() => {
-    const { limit: _l, before_id: _b, ...rest } = queryParams;
+    const rest = { ...queryParams };
+    delete rest.limit; delete rest.before_id;
     return buildExportUrl(rest);
   }, [queryParams]);
 

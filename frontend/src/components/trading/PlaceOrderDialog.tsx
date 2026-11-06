@@ -1,4 +1,6 @@
-import { useEffect, useState } from "react";
+import { useAuth } from "@/contexts/AuthContext";
+import { errorMessage } from "@/lib/apiError";
+import { useEffect, useState, useId } from "react";
 import { toast } from "sonner";
 import {
   Dialog,
@@ -11,6 +13,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { placeOrder } from "@/api/optionchain";
+import { roundToTick, adjustPrice, formatPrice } from "@/lib/price";
 import { cn } from "@/lib/utils";
 
 const PRICE_TYPES = [
@@ -26,7 +29,6 @@ const FNO_PRODUCTS = [
 ] as const;
 
 const EQUITY_PRODUCTS = [
-  { value: "CNC", label: "CNC" },
   { value: "MIS", label: "MIS" },
 ] as const;
 
@@ -44,21 +46,11 @@ export interface PlaceOrderDialogProps {
   tickSize: number;
   strategy?: string;
   onSuccess?: (orderid: string) => void;
+  disabled?: boolean;
 }
 
 function isFnOExchange(exchange: string): boolean {
-  return ["NFO", "BFO", "MCX", "CDS", "BCD", "NCDEX"].includes(exchange);
-}
-
-function roundToTick(price: number, tickSize: number): number {
-  if (tickSize <= 0) return price;
-  return Number((Math.round(price / tickSize) * tickSize).toFixed(2));
-}
-
-function adjustPrice(price: number, tickSize: number, dir: "up" | "down"): number {
-  const rounded = roundToTick(price, tickSize);
-  if (dir === "up") return Number((rounded + tickSize).toFixed(2));
-  return Math.max(0, Number((rounded - tickSize).toFixed(2)));
+  return ["MSE", "NFO", "BFO", "MCX", "CDS", "BCD", "NCDEX", "GIFT", "GLOBAL"].includes(exchange);
 }
 
 export function PlaceOrderDialog({
@@ -72,19 +64,22 @@ export function PlaceOrderDialog({
   tickSize,
   strategy = "OptionChain",
   onSuccess,
+  disabled = false,
 }: PlaceOrderDialogProps) {
+  const { user } = useAuth();
+  const fieldId = useId();
   const [formAction, setFormAction] = useState<"BUY" | "SELL">(action);
   const [quantityMode, setQuantityMode] = useState<"lots" | "shares">("lots");
   const [lots, setLots] = useState(1);
   const [priceType, setPriceType] = useState<PriceType>("MARKET");
   const [product, setProduct] = useState<Product>(
-    isFnOExchange(exchange) ? "NRML" : "CNC"
+    isFnOExchange(exchange) ? "NRML" : "MIS"
   );
   const [price, setPrice] = useState(0);
   const [triggerPrice, setTriggerPrice] = useState(0);
   const [submitting, setSubmitting] = useState(false);
 
-  const productOptions = isFnOExchange(exchange) ? FNO_PRODUCTS : EQUITY_PRODUCTS;
+  const productOptions = isFnOExchange(exchange) ? FNO_PRODUCTS.filter(p => p.value !== "MIS" || !["MSE", "GIFT", "GLOBAL", "CRYPTO"].includes(exchange)) : EQUITY_PRODUCTS;
   const totalQty = lots * lotSize;
   const needsPrice = priceType === "LIMIT" || priceType === "SL";
   const needsTrigger = priceType === "SL" || priceType === "SL-M";
@@ -95,7 +90,7 @@ export function PlaceOrderDialog({
     setQuantityMode("lots");
     setLots(1);
     setPriceType("MARKET");
-    setProduct(isFnOExchange(exchange) ? "NRML" : "CNC");
+    setProduct(isFnOExchange(exchange) ? "NRML" : "MIS");
     setPrice(ltp ? roundToTick(ltp, tickSize) : 0);
     setTriggerPrice(0);
   }, [open, action, exchange, ltp, tickSize]);
@@ -119,7 +114,7 @@ export function PlaceOrderDialog({
   };
 
   const handleSubmit = async () => {
-    if (!isValid()) {
+    if (disabled || !isValid()) {
       toast.error("Please fill all required fields");
       return;
     }
@@ -137,19 +132,14 @@ export function PlaceOrderDialog({
         ...(needsTrigger ? { trigger_price: triggerPrice } : {}),
       });
       if (resp.status === "success" && resp.orderid) {
-        toast.success(`Order placed: ${resp.orderid}`);
+        toast.success(`Paper order placed: ${resp.orderid}`);
         onSuccess?.(resp.orderid);
         onOpenChange(false);
       } else {
         toast.error(resp.message ?? "Order placement failed");
       }
     } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { message?: string } }; message?: string })
-          ?.response?.data?.message ??
-        (err as { message?: string })?.message ??
-        "Order placement failed";
-      toast.error(msg);
+      toast.error(errorMessage(err));
     } finally {
       setSubmitting(false);
     }
@@ -159,15 +149,15 @@ export function PlaceOrderDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-[440px]">
+      <DialogContent className="max-h-[90dvh] overflow-y-auto sm:max-w-[440px]">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2 text-sm">
-            <span>Place Order —</span>
+            <span>Paper Order —</span>
             <span
               className={
                 formAction === "BUY"
-                  ? "text-green-600 dark:text-green-400 font-semibold"
-                  : "text-red-600 dark:text-red-400 font-semibold"
+                  ? "text-green-700 font-semibold"
+                  : "text-red-700 font-semibold"
               }
             >
               {formAction}
@@ -177,23 +167,24 @@ export function PlaceOrderDialog({
         </DialogHeader>
 
         <div className="space-y-4 py-2">
+          {user?.role === "user" && <p className="text-sm leading-relaxed text-muted-foreground">Brokerage is 4% of executed trade value on every buy and sell: 3% to your broker and 1% to Super Admin. Charges are deducted from your virtual funds when a fill executes.</p>}
           {ltp !== undefined && (
             <div className="rounded-md bg-muted/50 px-3 py-2 text-xs flex justify-between">
               <span className="text-muted-foreground">LTP</span>
-              <span className="font-mono font-semibold">{ltp.toFixed(2)}</span>
+              <span className="font-mono font-semibold">{formatPrice(ltp)}</span>
             </div>
           )}
 
           {/* Action toggle */}
           <div className="space-y-1.5">
-            <Label className="text-xs">Action</Label>
+            <span className="text-xs font-medium">Action</span>
             <div className="flex gap-2">
               <Button
                 type="button"
                 variant={formAction === "BUY" ? "default" : "outline"}
                 className={cn(
                   "flex-1",
-                  formAction === "BUY" && "bg-green-600 text-white hover:bg-green-700"
+                  formAction === "BUY" && "bg-green-700 text-white hover:bg-green-800"
                 )}
                 onClick={() => setFormAction("BUY")}
               >
@@ -204,7 +195,7 @@ export function PlaceOrderDialog({
                 variant={formAction === "SELL" ? "default" : "outline"}
                 className={cn(
                   "flex-1",
-                  formAction === "SELL" && "bg-red-600 text-white hover:bg-red-700"
+                  formAction === "SELL" && "bg-red-700 text-white hover:bg-red-800"
                 )}
                 onClick={() => setFormAction("SELL")}
               >
@@ -216,7 +207,7 @@ export function PlaceOrderDialog({
           {/* Quantity */}
           <div className="space-y-1.5">
             <div className="flex items-center justify-between">
-              <Label className="text-xs">Quantity</Label>
+              <Label htmlFor={fieldId + "-quantity"} className="text-xs">Quantity</Label>
               <div className="flex gap-1">
                 <button
                   type="button"
@@ -245,6 +236,7 @@ export function PlaceOrderDialog({
               </div>
             </div>
             <Input
+              id={fieldId + "-quantity"}
               type="number"
               value={displayQty}
               onChange={(e) => handleQuantityChange(e.target.value)}
@@ -259,8 +251,9 @@ export function PlaceOrderDialog({
           {/* Price type + product */}
           <div className="grid grid-cols-2 gap-3">
             <div className="space-y-1.5">
-              <Label className="text-xs">Price Type</Label>
+              <Label htmlFor={fieldId + "-price-type"} className="text-xs">Price Type</Label>
               <select
+                id={fieldId + "-price-type"}
                 value={priceType}
                 onChange={(e) => setPriceType(e.target.value as PriceType)}
                 className="h-8 w-full rounded-lg border border-input bg-background px-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
@@ -273,8 +266,9 @@ export function PlaceOrderDialog({
               </select>
             </div>
             <div className="space-y-1.5">
-              <Label className="text-xs">Product</Label>
+              <Label htmlFor={fieldId + "-product"} className="text-xs">Product</Label>
               <select
+                id={fieldId + "-product"}
                 value={product}
                 onChange={(e) => setProduct(e.target.value as Product)}
                 className="h-8 w-full rounded-lg border border-input bg-background px-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
@@ -290,19 +284,21 @@ export function PlaceOrderDialog({
 
           {needsPrice && (
             <div className="space-y-1.5">
-              <Label className="text-xs">Price</Label>
+              <Label htmlFor={fieldId + "-price"} className="text-xs">Price</Label>
               <div className="flex gap-2">
                 <Button
                   type="button"
                   variant="outline"
                   size="sm"
                   className="px-2"
+                  aria-label="Decrease price by one tick"
                   onClick={() => setPrice(adjustPrice(price, tickSize, "down"))}
                 >
                   −
                 </Button>
                 <Input
                   type="number"
+                  id={fieldId + "-price"}
                   value={price}
                   onChange={(e) => setPrice(parseFloat(e.target.value) || 0)}
                   onBlur={() => setPrice(roundToTick(price, tickSize))}
@@ -315,6 +311,7 @@ export function PlaceOrderDialog({
                   variant="outline"
                   size="sm"
                   className="px-2"
+                  aria-label="Increase price by one tick"
                   onClick={() => setPrice(adjustPrice(price, tickSize, "up"))}
                 >
                   +
@@ -326,19 +323,21 @@ export function PlaceOrderDialog({
 
           {needsTrigger && (
             <div className="space-y-1.5">
-              <Label className="text-xs">Trigger Price</Label>
+              <Label htmlFor={fieldId + "-trigger-price"} className="text-xs">Trigger Price</Label>
               <div className="flex gap-2">
                 <Button
                   type="button"
                   variant="outline"
                   size="sm"
                   className="px-2"
+                  aria-label="Decrease trigger price by one tick"
                   onClick={() => setTriggerPrice(adjustPrice(triggerPrice, tickSize, "down"))}
                 >
                   −
                 </Button>
                 <Input
                   type="number"
+                  id={fieldId + "-trigger-price"}
                   value={triggerPrice}
                   onChange={(e) => setTriggerPrice(parseFloat(e.target.value) || 0)}
                   onBlur={() => setTriggerPrice(roundToTick(triggerPrice, tickSize))}
@@ -351,6 +350,7 @@ export function PlaceOrderDialog({
                   variant="outline"
                   size="sm"
                   className="px-2"
+                  aria-label="Increase trigger price by one tick"
                   onClick={() => setTriggerPrice(adjustPrice(triggerPrice, tickSize, "up"))}
                 >
                   +
@@ -366,11 +366,11 @@ export function PlaceOrderDialog({
           </Button>
           <Button
             onClick={handleSubmit}
-            disabled={!isValid() || submitting}
+            disabled={disabled || !isValid() || submitting}
             className={cn(
               formAction === "BUY"
-                ? "bg-green-600 text-white hover:bg-green-700"
-                : "bg-red-600 text-white hover:bg-red-700"
+                ? "bg-green-700 text-white hover:bg-green-800"
+                : "bg-red-700 text-white hover:bg-red-800"
             )}
           >
             {submitting ? "Placing…" : `Place ${formAction} Order`}

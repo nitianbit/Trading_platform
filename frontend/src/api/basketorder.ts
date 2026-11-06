@@ -11,7 +11,7 @@
  * is malformed, before placing any orders.
  */
 
-import { getApiKey } from "@/api/apikey";
+import { resolveApiKey } from "@/api/apikey";
 import api from "@/config/api";
 
 export type Action = "BUY" | "SELL";
@@ -53,21 +53,7 @@ export interface BasketOrderResponse {
   message?: string;
 }
 
-let cachedApiKey: string | null = null;
 
-async function resolveApiKey(): Promise<string> {
-  if (cachedApiKey) return cachedApiKey;
-  const { api_key } = await getApiKey();
-  if (!api_key) {
-    throw new Error("No API key found. Generate one on the API Key page first.");
-  }
-  cachedApiKey = api_key;
-  return api_key;
-}
-
-export function clearCachedApiKey(): void {
-  cachedApiKey = null;
-}
 
 export async function placeBasketOrder(
   payload: BasketOrderRequest,

@@ -89,7 +89,8 @@ def snapshot_for_date(snapshot_date: date | None = None) -> int:
             )
 
             realized = fund.realized_pnl if fund else 0.0
-            unrealized = fund.unrealized_pnl if fund else 0.0
+            from backend.sandbox.position_manager import get_unrealized_total
+            unrealized = get_unrealized_total(db, user_id)
             available = fund.available if fund else 0.0
             used = fund.used_margin if fund else 0.0
             start = fund.starting_capital if fund else 0.0

@@ -187,7 +187,7 @@ def _tick() -> None:
 
     # --- Weekly reset ---
     reset_job = "weekly_reset"
-    reset_day = _read_cfg("reset_day", "Sunday")
+    reset_day = _read_cfg("reset_day", "Never")
     if reset_day != "Never":
         reset_time = _read_cfg("reset_time", "00:00")
         if _due_weekly(reset_day, reset_time, now, _read_last_run(reset_job) == week_key):

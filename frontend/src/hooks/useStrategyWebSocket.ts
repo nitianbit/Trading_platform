@@ -132,7 +132,7 @@ export function useStrategyWebSocket(
     }
   }, []);
 
-  const connect = useCallback(() => {
+  const connect = useCallback(function connect() {
     if (!shouldRunRef.current || strategyId === null) return;
     if (wsRef.current && wsRef.current.readyState <= WebSocket.OPEN) return;
 
@@ -267,7 +267,7 @@ export function useStrategyWebSocket(
       setStatus("reconnecting");
       reconnectTimerRef.current = setTimeout(connect, delayMs);
     };
-  }, [strategyId]);
+  }, [strategyId, queryClient]);
 
   // Track the last strategyId we connected against so we can clear
   // per-strategy state when (and only when) the user navigates to a

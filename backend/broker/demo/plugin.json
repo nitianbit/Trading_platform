@@ -1,0 +1,7 @@
+{
+  "name": "DHK Demo Data",
+  "display_name": "Synthetic demonstration feed",
+  "broker_name": "demo",
+  "description": "Synthetic market prices. Platform-owned paper execution only."
+}
+

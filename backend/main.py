@@ -27,23 +27,26 @@ logger = get_logger("openbull")
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def _lifespan(app: FastAPI):
     # Startup
     logger.info("OpenBull starting up...")
 
-    # Create all tables
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    logger.info("Database tables ready")
-
-    # In-place schema micro-migrations (column adds on existing tables that
-    # create_all does not touch). Idempotent — safe on every restart.
-    try:
+    from backend.sandbox._db import get_engine
+    if settings.production:
+        from backend.paper.readiness import require_migrated
+        await asyncio.to_thread(require_migrated, get_engine())
+    else:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
         from backend.utils.schema_migrations import run_startup_migrations
+        await asyncio.to_thread(run_startup_migrations)
+        from backend.security import migrate_api_keys
+        await asyncio.to_thread(migrate_api_keys, get_engine())
 
-        run_startup_migrations()
-    except Exception:
-        logger.exception("Startup migrations raised")
+    from backend.paper.market import seed_symbols, publish_quotes, run_feed
+    await asyncio.to_thread(seed_symbols)
+    await asyncio.to_thread(publish_quotes)
+    demo_feed = asyncio.create_task(run_feed())
 
     # Start the async-safe DB writer for api_logs. The middleware enqueues
     # rows non-blocking; a daemon thread drains the queue and trims the
@@ -74,6 +77,7 @@ async def lifespan(app: FastAPI):
         logger.info("Sandbox: catch-up done; engine + scheduler + MTM updater started")
     except Exception:
         logger.exception("Failed to start sandbox engine/scheduler/MTM")
+        raise
 
     # Wire all event-bus subscribers (strategy audit, future: telegram, etc.).
     # Done after tables exist so audit subscribers can write rows on any
@@ -131,6 +135,11 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown
+    demo_feed.cancel()
+    try:
+        await demo_feed
+    except asyncio.CancelledError:
+        pass
     await shutdown_ws_proxy()
     ws_task.cancel()
     try:
@@ -175,11 +184,22 @@ async def lifespan(app: FastAPI):
     _std_logging.shutdown()
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    from backend.paper.runtime import single_runtime
+    with single_runtime():
+        async with _lifespan(app):
+            yield
+
+
 app = FastAPI(
-    title="OpenBull",
-    description="Options Trading Platform for Indian Brokers",
+    title="DHK Paper",
+    description="Platform-owned virtual trading with synthetic demonstration prices",
     version="0.1.0",
     lifespan=lifespan,
+    docs_url=None if settings.production else "/docs",
+    redoc_url=None if settings.production else "/redoc",
+    openapi_url=None if settings.production else "/openapi.json",
 )
 
 app.state.limiter = limiter
@@ -205,10 +225,12 @@ async def add_security_headers(request: Request, call_next):
     response.headers["X-XSS-Protection"] = "1; mode=block"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    if settings.production:
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     # CSP
     response.headers["Content-Security-Policy"] = (
-        "default-src 'self'; "
-        "script-src 'self' 'unsafe-inline'; "
+        "default-src 'self'; " +
+        ("script-src 'self'; " if settings.production else "script-src 'self' 'unsafe-inline'; ") +
         "style-src 'self' 'unsafe-inline'; "
         "img-src 'self' data: https:; "
         "connect-src 'self' wss: ws:; "
@@ -231,13 +253,9 @@ app.add_middleware(RequestLoggingMiddleware)
 
 # Register routers
 from backend.routers.auth import router as auth_router
-from backend.routers.broker_config import router as broker_config_router
-from backend.routers.broker_oauth import router as broker_oauth_router
 from backend.routers.error_logs import router as error_logs_router
 
 app.include_router(auth_router)
-app.include_router(broker_config_router)
-app.include_router(broker_oauth_router)
 app.include_router(error_logs_router)
 
 # Phase 3: Symbol search and master contract download
@@ -308,7 +326,26 @@ from backend.routers.playground import router as playground_router
 app.include_router(playground_router)
 
 
-# Health check
+from backend.routers.paper import router as paper_router
+app.include_router(paper_router)
+
+# Readiness includes actual dependencies and the synthetic feed heartbeat.
 @app.get("/health")
 async def health():
-    return {"status": "ok", "app": "OpenBull", "version": "0.1.0"}
+    from sqlalchemy import text
+    from backend.database import async_session
+    from backend.paper.market import feed_is_healthy
+    from backend.utils.redis_client import get_redis
+    from fastapi.responses import JSONResponse
+    checks = {"database": False, "redis": False, "feed": feed_is_healthy()}
+    try:
+        async with async_session() as db:
+            await asyncio.wait_for(db.execute(text("SELECT 1")), timeout=2)
+            checks["database"] = True
+        checks["redis"] = bool(await asyncio.wait_for(get_redis().ping(), timeout=2))
+    except Exception:
+        pass
+    healthy = all(checks.values())
+    return JSONResponse(status_code=200 if healthy else 503, content={
+        "status": "ok" if healthy else "degraded", "app": "DHK Paper", "version": "0.1.0",
+        "paper_only": True, "data_source": "synthetic_demo", "checks": checks})

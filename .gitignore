@@ -56,3 +56,14 @@ htmlcov/
 *.pem
 *.key
 credentials.json
+
+# Local QA credentials and screenshots
+.local/
+.impeccable/
+
+# Private production configuration
+deploy/.env.production
+
+# Local agent permissions/preferences must stay private.
+.claude/
+.codex/

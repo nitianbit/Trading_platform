@@ -676,6 +676,7 @@ export function PayoffChart({
     };
   }, [
     range,
+    t0Available,
     expiryY,
     t0Y,
     sigmaXs,

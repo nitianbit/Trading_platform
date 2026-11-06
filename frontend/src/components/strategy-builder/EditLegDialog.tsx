@@ -125,6 +125,7 @@ export function EditLegDialog({
   // Hydrate local state from the leg when the dialog opens.
   useEffect(() => {
     if (!leg) return;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- Hydrate the editable form when its external selection changes.
     setAction(leg.action);
     setOptionType(leg.option_type);
     setExpiryDisplay(legExpiryDisplay);

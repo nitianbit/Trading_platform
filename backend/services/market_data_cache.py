@@ -254,6 +254,7 @@ class MarketDataCache:
                     }
                 elif mode == 2:  # Quote
                     entry["quote"] = {
+                        **{key: market_data[key] for key in ("bid", "ask") if key in market_data},
                         "open": market_data.get("open"),
                         "high": market_data.get("high"),
                         "low": market_data.get("low"),

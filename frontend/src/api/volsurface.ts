@@ -1,5 +1,5 @@
 import api from "@/config/api";
-import { getApiKey } from "@/api/apikey";
+import { resolveApiKey } from "@/api/apikey";
 
 export interface VolSurfaceExpiry {
   date: string;
@@ -21,15 +21,6 @@ export interface VolSurfaceResponse {
   message?: string;
 }
 
-let cachedApiKey: string | null = null;
-
-async function resolveApiKey(): Promise<string> {
-  if (cachedApiKey) return cachedApiKey;
-  const { api_key } = await getApiKey();
-  if (!api_key) throw new Error("No API key found. Generate one on the API Key page first.");
-  cachedApiKey = api_key;
-  return api_key;
-}
 
 export async function fetchVolSurface(params: {
   underlying: string;

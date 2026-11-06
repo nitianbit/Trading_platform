@@ -53,77 +53,30 @@ def _today_start_ist() -> datetime:
 
 
 def _close_stale_mis_positions() -> int:
-    """Settle any MIS position whose row is from before today.
-
-    Long positions are closed at the position's stored LTP if available,
-    else at the average price (no PnL). Realized PnL flows into the
-    *cumulative* ``realized_pnl`` bucket only — ``today_realized_pnl`` is
-    never bumped from a yesterday-flavoured close. Margin is released
-    through the normal :func:`fund_manager.release_margin` path.
-    """
-    today_start = _today_start_ist()
-    closed = 0
-    margin_releases: dict[int, tuple[float, float]] = {}  # uid -> (margin, realized)
-
+    from backend.sandbox.position_manager import apply_fill
+    boundary = _today_start_ist()
     with session_scope() as db:
-        rows = (
-            db.execute(
-                select(SandboxPosition).where(
-                    SandboxPosition.product == "MIS",
-                    SandboxPosition.net_quantity != 0,
-                    SandboxPosition.updated_at < today_start,
-                )
-            )
-            .scalars()
-            .all()
-        )
-        for pos in rows:
-            ltp = get_ltp_with_fallback(pos.user_id, pos.symbol, pos.exchange)
-            close_price = float(ltp) if (ltp and ltp > 0) else float(pos.average_price or 0.0)
-            qty = pos.net_quantity
-            if qty > 0:
-                realized = (close_price - pos.average_price) * qty
-            else:
-                realized = (pos.average_price - close_price) * abs(qty)
-            margin = float(pos.margin_blocked or 0.0)
-
-            pos.realized_pnl = round(float(pos.realized_pnl or 0.0) + realized, 4)
-            pos.net_quantity = 0
-            pos.average_price = 0.0
-            pos.margin_blocked = 0.0
-            pos.unrealized_pnl = 0.0
-            pos.pnl = round(pos.realized_pnl, 4)
-
-            agg = margin_releases.get(pos.user_id, (0.0, 0.0))
-            margin_releases[pos.user_id] = (
-                round(agg[0] + margin, 2),
-                round(agg[1] + realized, 4),
-            )
-            closed += 1
-
-    # Release margin / book realized PnL — but keep realized out of
-    # today_realized_pnl by *not* using release_margin's combined call. We
-    # add the cumulative ``realized_pnl`` and ``available`` directly via a
-    # split: release the margin (no PnL), then bump cumulative realized
-    # without touching today's bucket.
-    for uid, (margin, realized) in margin_releases.items():
-        try:
-            if margin > 0:
-                fund_manager.release_margin(uid, margin, realized_pnl=0.0)
-            if realized:
-                # Bypass today_realized_pnl — yesterday's close doesn't
-                # belong to today's session metric. We commit straight to
-                # ``realized_pnl`` + ``available``.
-                with session_scope() as db:
-                    funds = fund_manager.ensure_fund_row(db, uid)
-                    funds.realized_pnl += realized
-                    funds.available += realized
-        except Exception:
-            logger.exception("catch_up: stale-MIS close failed for user %d", uid)
-
-    if closed:
-        logger.info("catch_up: closed %d stale MIS positions", closed)
-    return closed
+        users = list(db.scalars(select(SandboxPosition.user_id).where(
+            SandboxPosition.product == "MIS", SandboxPosition.net_quantity != 0,
+            SandboxPosition.updated_at < boundary).distinct()))
+    count = 0
+    for uid in sorted(users):
+        with session_scope() as db:
+            funds = fund_manager.ensure_fund_row(db, uid)
+            positions = list(db.scalars(select(SandboxPosition).where(
+                SandboxPosition.user_id == uid, SandboxPosition.product == "MIS",
+                SandboxPosition.net_quantity != 0, SandboxPosition.updated_at < boundary)))
+            for pos in positions:
+                price = get_ltp_with_fallback(uid, pos.symbol, pos.exchange) or pos.ltp or pos.average_price
+                today_realized = pos.today_realized_pnl
+                realized, released = apply_fill(uid, pos.symbol, pos.exchange, pos.product,
+                    "SELL" if pos.net_quantity > 0 else "BUY", abs(pos.net_quantity), price, db=db)
+                pos.today_realized_pnl = today_realized
+                funds.available = round(funds.available + released + realized, 2)
+                funds.used_margin = round(funds.used_margin - released, 2)
+                funds.realized_pnl = round(funds.realized_pnl + realized, 4)
+                count += 1
+    return count
 
 
 def _settle_stale_cnc_positions() -> int:
@@ -179,7 +132,11 @@ def _close_expired_fno_positions() -> int:
             .scalars()
             .all()
         )
+        from backend.paper.market import BY_KEY
         for pos in rows:
+            # Demo symbols represent continuous synthetic contracts, not expiring exchange series.
+            if (pos.symbol, pos.exchange) in BY_KEY:
+                continue
             sym = db.execute(
                 select(SymToken).where(
                     SymToken.symbol == pos.symbol,

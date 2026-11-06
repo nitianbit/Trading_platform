@@ -1,4 +1,5 @@
 import hashlib
+import hmac
 import base64
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -8,7 +9,8 @@ from argon2.exceptions import VerifyMismatchError
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes
-from jose import jwt, JWTError
+import jwt
+from jwt import InvalidTokenError
 
 from backend.config import get_settings
 
@@ -61,19 +63,27 @@ def decrypt_value(ciphertext: str) -> str:
     return _fernet.decrypt(ciphertext.encode()).decode()
 
 
-# -- API key hashing (Argon2 for verification) --
+# -- Random API keys: indexed HMAC-SHA256, passwords remain Argon2 --
 
 def hash_api_key(api_key: str) -> str:
-    peppered = api_key + settings.encryption_pepper
-    return _ph.hash(peppered)
+    return hmac.new(settings.encryption_pepper.encode(), api_key.encode(), hashlib.sha256).hexdigest()
 
 
 def verify_api_key(api_key: str, api_key_hash: str) -> bool:
-    peppered = api_key + settings.encryption_pepper
-    try:
-        return _ph.verify(api_key_hash, peppered)
-    except VerifyMismatchError:
-        return False
+    return hmac.compare_digest(hash_api_key(api_key), api_key_hash)
+
+
+def migrate_api_keys(engine) -> None:
+    """Preserve existing keys while replacing their legacy Argon2 verifiers."""
+    from sqlalchemy import select, text
+    from sqlalchemy.orm import Session
+    from backend.models.auth import ApiKey
+    with Session(engine) as db, db.begin():
+        db.execute(text("SELECT pg_advisory_xact_lock(2082, 0)"))
+        for record in db.scalars(select(ApiKey).where(ApiKey.api_key_hash.like("$argon2%")).with_for_update()):
+            record.api_key_hash = hash_api_key(decrypt_value(record.api_key_encrypted))
+        db.flush()
+        db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys (api_key_hash)"))
 
 
 def generate_api_key() -> str:
@@ -115,5 +125,5 @@ def decode_access_token(token: str) -> dict | None:
     try:
         payload = jwt.decode(token, settings.app_secret_key, algorithms=[ALGORITHM])
         return payload
-    except JWTError:
+    except InvalidTokenError:
         return None

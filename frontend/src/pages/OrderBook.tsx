@@ -1,3 +1,4 @@
+import { formatPrice } from "@/lib/price";
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
@@ -229,8 +230,8 @@ export default function OrderBook() {
       { header: "Product", value: (r) => r.product },
       { header: "Price Type", value: (r) => r.pricetype },
       { header: "Quantity", value: (r) => r.quantity },
-      { header: "Price", value: (r) => r.price.toFixed(2) },
-      { header: "Trigger Price", value: (r) => r.trigger_price.toFixed(2) },
+      { header: "Price", value: (r) => formatPrice(r.price) },
+      { header: "Trigger Price", value: (r) => formatPrice(r.trigger_price) },
       { header: "Status", value: (r) => r.order_status },
     ];
     downloadCsv({ filename: "orderbook", columns, rows });
@@ -354,8 +355,8 @@ export default function OrderBook() {
                         <span
                           className={
                             order.action.toUpperCase() === "BUY"
-                              ? "font-medium text-green-600 dark:text-green-400"
-                              : "font-medium text-red-600 dark:text-red-400"
+                              ? "font-medium text-green-700"
+                              : "font-medium text-red-700"
                           }
                         >
                           {order.action}
@@ -365,7 +366,7 @@ export default function OrderBook() {
                       <TableCell>{order.pricetype}</TableCell>
                       <TableCell className="text-right">{order.quantity}</TableCell>
                       <TableCell className="text-right">
-                        {order.price.toFixed(2)}
+                        {formatPrice(order.price)}
                       </TableCell>
                       <TableCell
                         className="whitespace-nowrap font-mono text-xs tabular-nums text-muted-foreground"

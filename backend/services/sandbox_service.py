@@ -6,22 +6,19 @@ this module when ``get_trading_mode() == "sandbox"``. Every function returns
 the same ``(success, response_dict, status_code)`` tuple shape as its live
 counterpart so the dispatch in ``backend/services/*.py`` is a one-line swap.
 
-MARKET orders fill immediately using the latest LTP from the
-:class:`MarketDataCache`. If no tick has arrived yet for that symbol the order
-is accepted as ``open`` and the execution engine will fill it on the next tick
-or poll cycle.
+MARKET orders require a fresh synthetic price. Immediate admission and fill
+share one transaction; pending LIMIT/SL orders are revalidated on execution.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any
 
 from backend.sandbox import fund_manager, holdings_manager, order_manager, position_manager
-from backend.sandbox.execution_engine import _try_fill_order
 from backend.sandbox.order_validation import validate_order
 from backend.sandbox.quote_helper import get_ltp as get_ltp_with_fallback
-from backend.sandbox.symbol_info import classify_from_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +49,12 @@ def _current_ltp(symbol: str, exchange: str) -> float | None:
 
 def place_order(user_id: int, order_data: dict[str, Any]) -> tuple[bool, dict[str, Any], int]:
     """Sandbox equivalent of ``place_order_with_auth``."""
+    from backend.sandbox._db import session_scope
+    with session_scope() as db:
+        return _place_order(user_id, order_data, db)
+
+
+def _place_order(user_id, order_data, db):
     symbol = order_data.get("symbol")
     exchange = order_data.get("exchange")
     action = (order_data.get("action") or "").upper()
@@ -65,7 +68,7 @@ def place_order(user_id: int, order_data: dict[str, Any]) -> tuple[bool, dict[st
     # Validation gates (symbol exists, lot size, tick size, product/exchange
     # compatibility, CNC SELL inventory, post-squareoff block). Mirrors the
     # rejection rules openalgo enforces in its order_manager.
-    ok, reason, info = validate_order(
+    ok, reason, _ = validate_order(
         user_id=user_id,
         symbol=symbol,
         exchange=exchange,
@@ -75,9 +78,13 @@ def place_order(user_id: int, order_data: dict[str, Any]) -> tuple[bool, dict[st
         product=product,
         price=price,
         trigger_price=trigger_price,
+        db=db,
     )
     if not ok:
+        if not math.isfinite(price) or not math.isfinite(trigger_price) or not 0 <= quantity <= 2147483647:
+            return False, {"status": "error", "message": reason}, 400
         row = order_manager.create_order(
+        db=db,
             user_id=user_id,
             symbol=symbol,
             exchange=exchange,
@@ -94,29 +101,18 @@ def place_order(user_id: int, order_data: dict[str, Any]) -> tuple[bool, dict[st
         )
         return False, {"status": "error", "message": reason, "orderid": row.orderid}, 400
 
-    instrument_type = (
-        info.instrument_type if info else ""
-    ) or classify_from_symbol(symbol, exchange)
-
-    # For margin blocking we need a reference price.
-    #   * LIMIT / SL  → use the limit price (real, user-provided).
-    #   * MARKET/SL-M → use a real LTP. We try the live tick cache first and
-    #                   fall back to a broker quote API call. If both fail we
-    #                   reject the order rather than silently using ``price=0``
-    #                   (which would block 0 margin and accept an "order"
-    #                   with no real price behind it). Same behaviour as
-    #                   openalgo: no LTP → no fill, no acceptance.
+    # LIMIT/SL reserve against their limit; MARKET/SL-M require a fresh feed tick.
     ref_price = price
     if pricetype in ("MARKET", "SL-M"):
         ltp = get_ltp_with_fallback(user_id, symbol, exchange)
         if not ltp or ltp <= 0:
             reason = (
                 f"Cannot price {pricetype} order — no LTP available for "
-                f"{symbol}/{exchange} (live tick cache empty and broker quote "
-                f"fetch failed). Place a LIMIT order with an explicit price, "
+                f"{symbol}/{exchange}. Place a LIMIT order with an explicit price, "
                 f"or retry once the symbol streams a tick."
             )
             row = order_manager.create_order(
+                db=db,
                 user_id=user_id,
                 symbol=symbol,
                 exchange=exchange,
@@ -134,67 +130,11 @@ def place_order(user_id: int, order_data: dict[str, Any]) -> tuple[bool, dict[st
             return False, {"status": "error", "message": reason, "orderid": row.orderid}, 400
         ref_price = float(ltp)
 
-    # Compute the *fresh* margin this order would require if it opened a new
-    # position from flat. We then reduce it to ``actual_margin`` based on what
-    # is already held in the position book — same logic as openalgo's sandbox:
-    #   • opposite-direction order, qty <= existing qty  → block 0 (pure reduce)
-    #   • opposite-direction order, qty  > existing qty  → block only the excess
-    #   • same-direction or new position                  → block the full margin
-    # This prevents the user from being charged twice for capital that's
-    # already locked in the position they're closing.
-    from backend.sandbox._db import session_scope
-
-    with session_scope() as db:
-        full_margin = fund_manager.compute_required_margin(
-            db, ref_price, quantity, product,
-            exchange=exchange, instrument_type=instrument_type, action=action,
-        )
-
-    actual_margin = full_margin
-    snap = position_manager.get_position_snapshot(user_id, symbol, exchange, product)
-    if snap is not None:
-        existing_qty, _existing_margin = snap
-        is_reducing = (
-            (existing_qty > 0 and action == "SELL")
-            or (existing_qty < 0 and action == "BUY")
-        )
-        if is_reducing:
-            existing_abs = abs(existing_qty)
-            if quantity <= existing_abs:
-                actual_margin = 0.0
-            else:
-                excess_qty = quantity - existing_abs
-                with session_scope() as db:
-                    actual_margin = fund_manager.compute_required_margin(
-                        db, ref_price, excess_qty, product,
-                        exchange=exchange, instrument_type=instrument_type, action=action,
-                    )
-
-    margin = actual_margin
-    blocked, err = fund_manager.block_margin(user_id, margin)
-    if not blocked:
-        # Still record a rejected order so the user can see it in the orderbook.
-        row = order_manager.create_order(
-            user_id=user_id,
-            symbol=symbol,
-            exchange=exchange,
-            action=action,
-            quantity=quantity,
-            pricetype=pricetype,
-            product=product,
-            price=price,
-            trigger_price=trigger_price,
-            strategy=strategy,
-            margin_blocked=0.0,
-            initial_status="rejected",
-            rejection_reason=err,
-        )
-        return False, {"status": "error", "message": err, "orderid": row.orderid}, 400
-
     # SL / SL-M orders sit at "trigger_pending" until the trigger fires.
     initial_status = "trigger_pending" if pricetype in ("SL", "SL-M") else "open"
 
     row = order_manager.create_order(
+        db=db,
         user_id=user_id,
         symbol=symbol,
         exchange=exchange,
@@ -205,18 +145,17 @@ def place_order(user_id: int, order_data: dict[str, Any]) -> tuple[bool, dict[st
         price=price,
         trigger_price=trigger_price,
         strategy=strategy,
-        margin_blocked=margin,
+        reference_price=ref_price,
         initial_status=initial_status,
     )
 
-    # Opportunistic immediate fill using whatever LTP we can find — cached
-    # tick first, broker quote as fallback. This makes MARKET orders go
-    # straight to ``complete`` even after market hours, matching openalgo's
-    # behaviour where the simulator always fills MARKET at LTP if any LTP is
-    # obtainable.
+    if row.status == "rejected":
+        return False, {"status": "error", "message": row.rejection_reason, "orderid": row.orderid}, 400
+
+    # The same ledger validates both immediate and background fills.
     ltp = get_ltp_with_fallback(user_id, symbol, exchange)
     if ltp is not None and ltp > 0:
-        _try_fill_order(row, float(ltp))
+        order_manager.fill(user_id, row.orderid, float(ltp), ltp=float(ltp), db=db)
 
     return True, {"status": "success", "orderid": row.orderid, "mode": "sandbox"}, 200
 
@@ -226,14 +165,16 @@ def modify_order(user_id: int, data: dict[str, Any]) -> tuple[bool, dict[str, An
     if not orderid:
         return False, {"status": "error", "message": "orderid is required"}, 400
 
-    updated = order_manager.modify_order(
-        user_id=user_id,
-        orderid=orderid,
-        quantity=_parse_int(data.get("quantity")) or None,
-        price=_parse_float(data.get("price")),
-        trigger_price=_parse_float(data.get("trigger_price")),
-        pricetype=data.get("pricetype"),
-    )
+    changes = {}
+    for field in ("quantity", "price", "trigger_price", "pricetype"):
+        if field in data:
+            value = data[field]
+            changes[field] = (_parse_int(value) if field == "quantity" else
+                _parse_float(value, float("nan")) if field in ("price", "trigger_price") else str(value))
+    try:
+        updated = order_manager.modify_order(user_id=user_id, orderid=orderid, **changes)
+    except order_manager.OrderValidationError as error:
+        return False, {"status": "error", "message": str(error)}, 400
     if updated is None:
         return False, {"status": "error", "message": "Order not found or not modifiable"}, 404
     return True, {"status": "success", "orderid": updated.orderid, "mode": "sandbox"}, 200
@@ -243,9 +184,6 @@ def cancel_order(user_id: int, orderid: str) -> tuple[bool, dict[str, Any], int]
     cancelled = order_manager.cancel_order(user_id, orderid)
     if cancelled is None:
         return False, {"status": "error", "message": "Order not found or not cancellable"}, 404
-    # Release the margin we were holding against this order.
-    if cancelled.margin_blocked:
-        fund_manager.release_margin(user_id, cancelled.margin_blocked)
     return True, {"status": "success", "orderid": orderid, "mode": "sandbox"}, 200
 
 
@@ -255,8 +193,6 @@ def cancel_all_orders(user_id: int) -> tuple[bool, dict[str, Any], int]:
         c = order_manager.cancel_order(user_id, row.orderid)
         if c is not None:
             cancelled.append(c.orderid)
-            if c.margin_blocked:
-                fund_manager.release_margin(user_id, c.margin_blocked)
     return True, {"status": "success", "cancelled": cancelled, "mode": "sandbox"}, 200
 
 

@@ -1,0 +1,85 @@
+name: dhk-production
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: dhkpaper
+      POSTGRES_DB: dhkpaper
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set a generated database password}
+    volumes:
+      - database:/var/lib/postgresql/data
+    networks: [private]
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U dhkpaper -d dhkpaper"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: [redis-server, --requirepass, "${REDIS_PASSWORD:?Set a generated Redis password}"]
+    environment:
+      REDISCLI_AUTH: ${REDIS_PASSWORD}
+    networks: [private]
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  backend:
+    image: ${DHK_BACKEND_IMAGE:-dhk-paper-backend:local}
+    build:
+      context: .
+      args:
+        DHK_SOURCE_FINGERPRINT: ${DHK_SOURCE_FINGERPRINT:-}
+    restart: unless-stopped
+    env_file: deploy/.env.production
+    environment:
+      PRODUCTION: "true"
+      COOKIE_SECURE: "true"
+      FLASK_DEBUG: "false"
+      LOG_TO_FILE: "false"
+      WEBSOCKET_HOST: "0.0.0.0"
+      WEBSOCKET_PORT: "8783"
+      WEBSOCKET_URL: wss://${APP_DOMAIN}/stream
+      DATABASE_URL: postgresql+asyncpg://dhkpaper:${POSTGRES_PASSWORD}@db:5432/dhkpaper
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      FRONTEND_URL: https://${APP_DOMAIN}
+      CORS_ORIGINS: https://${APP_DOMAIN}
+    networks: [private, egress]
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8083/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+  web:
+    image: ${DHK_WEB_IMAGE:-dhk-paper-web:local}
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.web
+      args:
+        DHK_SOURCE_FINGERPRINT: ${DHK_SOURCE_FINGERPRINT:-}
+    restart: unless-stopped
+    environment:
+      APP_DOMAIN: ${APP_DOMAIN:?Set your public domain}
+    ports: ["80:80", "443:443", "443:443/udp"]
+    networks: [edge, private]
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      backend: {condition: service_healthy}
+networks:
+  egress:
+  edge:
+  private:
+    internal: true
+volumes:
+  database:
+  caddy_data:
+  caddy_config:

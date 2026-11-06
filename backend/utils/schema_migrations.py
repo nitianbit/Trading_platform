@@ -66,6 +66,11 @@ def run_startup_migrations() -> None:
     """Apply every pending in-place migration. Called from the app lifespan."""
     engine = create_engine(get_settings().sync_database_url, future=True)
     try:
+        from backend.paper.hierarchy import migrate_hierarchy
+        migrate_hierarchy(engine)
+
+        _add_column_if_missing(engine, "sandbox_funds", "brokerage_paise", "BIGINT NOT NULL DEFAULT 0")
+
         # Phase 3: api_logs gained a `mode` column + companion index.
         _add_column_if_missing(engine, "api_logs", "mode", "VARCHAR(10)")
         _add_index_if_missing(
@@ -112,5 +117,6 @@ def run_startup_migrations() -> None:
         )
     except Exception:
         logger.exception("Startup schema migration failed")
+        raise
     finally:
         engine.dispose()

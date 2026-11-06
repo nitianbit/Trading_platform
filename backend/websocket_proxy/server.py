@@ -59,6 +59,9 @@ MAX_SYMBOLS_PER_SUBSCRIBE = 1000
 
 
 def _create_adapter(broker_name: str, auth_token: str, config: dict) -> BaseBrokerAdapter:
+    if broker_name == "demo":
+        from backend.websocket_proxy.demo_adapter import DemoAdapter
+        return DemoAdapter(auth_token, config)
     if broker_name == "upstox":
         from backend.broker.upstox.streaming.upstox_adapter import UpstoxAdapter
         return UpstoxAdapter(auth_token, config)
@@ -193,6 +196,26 @@ async def _zmq_listener(zmq_port: int) -> None:
         logger.info("ZMQ listener shut down")
 
 
+async def _demo_listener() -> None:
+    """Fan out already-published synthetic quotes; never produce fill prices."""
+    from backend.paper.catalog import BY_KEY
+    from backend.paper.market import feed_is_healthy
+    while True:
+        if feed_is_healthy():
+            cache = get_market_data_cache()
+            for (symbol, exchange, mode), clients in list(_subscription_index.items()):
+                if (symbol, exchange) not in BY_KEY:
+                    continue
+                quote = cache.get_quote(symbol, exchange)
+                if quote is not None:
+                    await _broadcast(set(clients) & _authenticated_clients, {
+                        "type": "market_data", "symbol": symbol, "exchange": exchange,
+                        "mode": MODE_NAME[mode].lower(),
+                        "data": {**quote, "data_source": "synthetic_demo", "paper_only": True},
+                    })
+        await asyncio.sleep(1)
+
+
 # ---- Client handler ----
 
 def _ack(payload: dict, request_id) -> dict:
@@ -246,7 +269,6 @@ async def _handle_client(ws: websockets.WebSocketServerProtocol) -> None:
                     continue
 
                 broker_name = bname
-                _authenticated_clients.add(client_id)
 
                 # Create adapter if needed (single-user: one adapter at a time)
                 async with _adapter_lock:
@@ -260,7 +282,7 @@ async def _handle_client(ws: websockets.WebSocketServerProtocol) -> None:
                             await loop.run_in_executor(None, _adapter.connect)
 
                             # Start ZMQ listener
-                            _zmq_task = asyncio.create_task(_zmq_listener(zmq_port))
+                            _zmq_task = asyncio.create_task(_demo_listener() if broker_name == "demo" else _zmq_listener(zmq_port))
                             get_market_data_cache().set_connected(True, authenticated=True)
                             logger.info("Adapter %s created and connected (ZMQ port %d)", broker_name, zmq_port)
                         except Exception as e:
@@ -282,6 +304,7 @@ async def _handle_client(ws: websockets.WebSocketServerProtocol) -> None:
                             await _send_json(ws, _ack({"type": "auth", "status": "error", "message": "Broker connection failed"}, request_id))
                             continue
 
+                _authenticated_clients.add(client_id)
                 await _send_json(ws, _ack({
                     "type": "auth",
                     "status": "success",
@@ -298,7 +321,22 @@ async def _handle_client(ws: websockets.WebSocketServerProtocol) -> None:
                 if not isinstance(symbols, list) or len(symbols) > MAX_SYMBOLS_PER_SUBSCRIBE:
                     await _send_json(ws, _ack({"type": "subscribe", "status": "error", "message": f"symbols must be a list (max {MAX_SYMBOLS_PER_SUBSCRIBE})"}, request_id))
                     continue
-                mode = MODE_MAP.get(msg.get("mode", "LTP").upper(), MODE_LTP)
+                raw_mode = msg.get("mode", "LTP")
+                mode = MODE_MAP.get(raw_mode.upper()) if isinstance(raw_mode, str) else None
+                if mode is None:
+                    await _send_json(ws, _ack({"type": "subscribe", "status": "error", "message": "Unknown streaming mode"}, request_id))
+                    continue
+                from backend.paper.catalog import BY_KEY
+                if broker_name == "demo" and (not symbols or any(
+                    not isinstance(item, dict) or not isinstance(item.get("symbol"), str)
+                    or not isinstance(item.get("exchange"), str)
+                    or (item["symbol"], item["exchange"]) not in BY_KEY for item in symbols
+                )):
+                    await _send_json(ws, _ack({"type": "subscribe", "status": "error", "message": "Every subscription must identify an available demo instrument"}, request_id))
+                    continue
+                if broker_name == "demo" and mode == MODE_DEPTH:
+                    await _send_json(ws, _ack({"type": "subscribe", "status": "error", "message": "Synthetic streaming supports LTP and Quote only; depth is unavailable"}, request_id))
+                    continue
 
                 for item in symbols:
                     sym, exch = item.get("symbol"), item.get("exchange")

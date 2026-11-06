@@ -1,5 +1,7 @@
 export interface FundsData {
   availablecash: number;
+  brokerage_paid: number;
+  gross_realized_pnl: number;
   collateral: number;
   m2munrealized: number;
   m2mrealized: number;
@@ -21,6 +23,9 @@ export interface OrderbookItem {
 }
 
 export interface TradebookItem {
+  brokerage: number;
+  broker_credit: number;
+  admin_credit: number;
   symbol: string;
   exchange: string;
   action: string;

@@ -1,3 +1,4 @@
+import { formatPrice } from "@/lib/price";
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
@@ -5,6 +6,8 @@ import { toast } from "sonner";
 import { getPositions } from "@/api/dashboard";
 import { closeAllPositions } from "@/api/orders";
 import { placeOrder } from "@/api/optionchain";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
@@ -28,8 +31,8 @@ import {
 import type { PositionItem } from "@/types/order";
 
 function getPnlColor(value: number): string {
-  if (value > 0) return "text-green-600 dark:text-green-400";
-  if (value < 0) return "text-red-600 dark:text-red-400";
+  if (value > 0) return "text-green-700";
+  if (value < 0) return "text-red-700";
   return "";
 }
 
@@ -43,7 +46,7 @@ function isCloseable(p: PositionItem): boolean {
 
 /** Pending confirm state — `null` = no dialog open. */
 type PendingConfirm =
-  | { kind: "closeOne"; position: PositionItem }
+  | { kind: "closeOne"; position: PositionItem; quantity: number }
   | { kind: "closeAll"; count: number };
 
 export default function Positions() {
@@ -77,7 +80,7 @@ export default function Positions() {
    *  abs(qty). Long → SELL, short → BUY. The backend's placeorder
    *  endpoint takes care of sandbox vs live dispatch. */
   const closeOneMutation = useMutation({
-    mutationFn: async (pos: PositionItem) => {
+    mutationFn: async (pos: PositionItem & { exitQuantity?: number }) => {
       if (pos.quantity === 0) {
         throw new Error("Position is already flat");
       }
@@ -87,7 +90,7 @@ export default function Positions() {
         symbol: pos.symbol,
         exchange: pos.exchange,
         action,
-        quantity: Math.abs(pos.quantity),
+        quantity: pos.exitQuantity ?? Math.abs(pos.quantity),
         pricetype: "MARKET",
         product,
         strategy: "Close Position",
@@ -178,8 +181,8 @@ export default function Positions() {
         value: (r) =>
           r.quantity > 0 ? "LONG" : r.quantity < 0 ? "SHORT" : "FLAT",
       },
-      { header: "Average Price", value: (r) => r.average_price.toFixed(2) },
-      { header: "LTP", value: (r) => r.ltp.toFixed(2) },
+      { header: "Average Price", value: (r) => formatPrice(r.average_price) },
+      { header: "LTP", value: (r) => formatPrice(r.ltp) },
       { header: "P&L", value: (r) => r.pnl.toFixed(2) },
     ];
     downloadCsv({ filename: "positions", columns, rows });
@@ -236,7 +239,7 @@ export default function Positions() {
             {isLive ? (
               <Badge
                 variant="outline"
-                className="gap-1 border-green-500/40 text-green-600 dark:text-green-400"
+                className="gap-1 border-green-500/40 text-green-700"
               >
                 <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-green-500" />
                 Live
@@ -263,7 +266,7 @@ export default function Positions() {
                   <TableHead className="text-right">Avg Price</TableHead>
                   <TableHead className="text-right">LTP</TableHead>
                   <TableHead className="text-right">P&L</TableHead>
-                  <TableHead className="text-right">Actions</TableHead>
+                  <TableHead className="sticky right-0 bg-card text-right">Actions</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -281,23 +284,23 @@ export default function Positions() {
                       <TableCell>{pos.product}</TableCell>
                       <TableCell className="text-right">{pos.quantity}</TableCell>
                       <TableCell className="text-right">
-                        {pos.average_price.toFixed(2)}
+                        {formatPrice(pos.average_price)}
                       </TableCell>
                       <TableCell className="text-right">
-                        {pos.ltp.toFixed(2)}
+                        {formatPrice(pos.ltp)}
                       </TableCell>
                       <TableCell className={`text-right font-medium ${getPnlColor(pos.pnl)}`}>
                         {pos.pnl >= 0 ? "+" : ""}
                         {pos.pnl.toFixed(2)}
                       </TableCell>
-                      <TableCell>
+                      <TableCell className="sticky right-0 bg-card">
                         <div className="flex items-center justify-end gap-1">
                           <Button
                             variant="outline"
                             size="sm"
                             disabled={!closeable || closingThis}
                             onClick={() =>
-                              setConfirming({ kind: "closeOne", position: pos })
+                              setConfirming({ kind: "closeOne", position: pos, quantity: Math.abs(pos.quantity) })
                             }
                             title={
                               closeable
@@ -306,7 +309,7 @@ export default function Positions() {
                             }
                             className="text-destructive hover:bg-destructive/10 hover:text-destructive"
                           >
-                            {closingThis ? "…" : "Close"}
+                            {closingThis ? "…" : "Reduce / Close"}
                           </Button>
                         </div>
                       </TableCell>
@@ -333,7 +336,7 @@ export default function Positions() {
         title={
           confirming?.kind === "closeAll"
             ? "Close all positions"
-            : "Close position"
+            : "Reduce or close position"
         }
         description={
           confirming?.kind === "closeAll" ? (
@@ -350,23 +353,28 @@ export default function Positions() {
               </span>{" "}
               ({confirming.position.quantity > 0 ? "SELL" : "BUY"}{" "}
               <span className="font-mono">
-                {Math.abs(confirming.position.quantity)}
+                {confirming.quantity}
               </span>{" "}
               @ MARKET)?
+              <Label htmlFor="exit-quantity" className="mt-4 block">Quantity to close</Label>
+              <Input id="exit-quantity" type="number" min={1} max={Math.abs(confirming.position.quantity)} step={1}
+                value={confirming.quantity} onChange={event => setConfirming({ ...confirming, quantity: Number(event.target.value) })} />
+              <span className="mt-2 block text-xs">{Math.max(0, Math.abs(confirming.position.quantity) - confirming.quantity)} units remain open. Use a whole lot for derivatives. Brokerage applies to executed value.</span>
             </>
           ) : null
         }
         confirmLabel={
-          confirming?.kind === "closeAll" ? "Close all" : "Close position"
+          confirming?.kind === "closeAll" ? "Close all" : "Reduce or close position"
         }
         cancelLabel="Keep"
+        confirmDisabled={confirming?.kind === "closeOne" && (!Number.isInteger(confirming.quantity) || confirming.quantity < 1 || confirming.quantity > Math.abs(confirming.position.quantity))}
         variant="destructive"
         loading={closeOneMutation.isPending || closeAllMutation.isPending}
         onConfirm={() => {
           if (confirming?.kind === "closeAll") {
             closeAllMutation.mutate();
           } else if (confirming?.kind === "closeOne") {
-            closeOneMutation.mutate(confirming.position);
+            closeOneMutation.mutate({ ...confirming.position, exitQuantity: confirming.quantity });
           }
         }}
       />

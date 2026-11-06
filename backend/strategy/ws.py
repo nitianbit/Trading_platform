@@ -63,6 +63,10 @@ async def _authenticate(websocket: WebSocket) -> Optional[int]:
         )).scalar_one_or_none()
         if sess is None:
             return None
+        from backend.models.user import User
+        from backend.paper.hierarchy import account_can_access
+        if not await account_can_access(db, await db.get(User, int(user_id))):
+            return None
     return int(user_id)
 
 
